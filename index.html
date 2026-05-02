@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Live Net Worth Calculator</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg-2: #11172e;
+    --panel: #161e3c;
+    --panel-2: #1b2547;
+    --border: #25315c;
+    --text: #e8ecf8;
+    --muted: #8a93b2;
+    --accent: #6ea8fe;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --gold: #f5b301;
+    --silver: #c0c0c0;
+    --shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    background: radial-gradient(1200px 800px at 20% -10%, #1a2350 0%, transparent 60%),
+                radial-gradient(1000px 700px at 110% 10%, #2a1850 0%, transparent 60%),
+                var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .container { max-width: 1100px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 {
+    font-size: 18px; margin: 0; letter-spacing: .5px;
+    color: var(--muted); font-weight: 500; text-transform: uppercase;
+  }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+    padding: 6px 12px; border-radius: 999px; font-size: 12px;
+  }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    transition: all .15s ease;
+  }
+  button:hover { background: var(--panel-2); border-color: var(--accent); }
+  button.primary {
+    background: linear-gradient(135deg, #4f7dff, #6ea8fe); border: none; color: #fff;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.danger { color: var(--red); }
+  button.icon {
+    padding: 6px 10px; font-size: 14px; line-height: 1;
+  }
+
+  .hero {
+    background: linear-gradient(135deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--border);
+    border-radius: 18px; padding: 28px;
+    box-shadow: var(--shadow);
+    margin-bottom: 24px;
+    position: relative; overflow: hidden;
+  }
+  .hero::after {
+    content: ""; position: absolute; right: -80px; top: -80px;
+    width: 280px; height: 280px;
+    background: radial-gradient(closest-side, rgba(110,168,254,.25), transparent);
+  }
+  .hero-label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; }
+  .hero-value {
+    font-size: 56px; font-weight: 700; margin: 10px 0 2px;
+    letter-spacing: -1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .hero-value-2 {
+    font-size: 22px; font-weight: 500; color: var(--muted); margin-bottom: 8px;
+    font-variant-numeric: tabular-nums; letter-spacing: -.3px;
+  }
+  .hero-sub { color: var(--muted); font-size: 13px; }
+  .fx-pill {
+    display: inline-block; margin-left: 8px; padding: 2px 8px;
+    border-radius: 6px; font-size: 12px; color: var(--muted);
+    background: rgba(255,255,255,.04); border: 1px solid var(--border);
+  }
+  .hero-day {
+    display: inline-block; margin-left: 8px; padding: 2px 8px;
+    border-radius: 6px; font-size: 13px; font-weight: 600;
+  }
+  .up { color: var(--green); background: rgba(52, 211, 153, .12); }
+  .down { color: var(--red); background: rgba(248, 113, 113, .12); }
+  .flat { color: var(--muted); background: rgba(138,147,178,.12); }
+
+  .breakdown {
+    display: flex; gap: 6px; height: 8px; border-radius: 999px;
+    overflow: hidden; margin-top: 18px; background: rgba(255,255,255,.04);
+  }
+  .breakdown div { transition: width .4s ease; }
+  .legend {
+    display: flex; gap: 18px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--muted);
+  }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    border-radius: 3px; margin-right: 6px; vertical-align: middle;
+  }
+  .legend .l-stocks::before { background: #6ea8fe; }
+  .legend .l-metals::before { background: var(--gold); }
+  .legend .l-funds::before { background: #34d399; }
+  .legend .l-cash::before { background: #a78bfa; }
+
+  /* Fund search dropdown */
+  .fund-search-wrap { flex: 1 1 280px; position: relative; }
+  .fund-search-wrap input { width: 100%; }
+  .fund-results {
+    display: none; position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+    max-height: 280px; overflow-y: auto; z-index: 10; box-shadow: var(--shadow);
+  }
+  .fund-results.show { display: block; }
+  .fr-item { padding: 9px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .fr-item:last-child { border-bottom: none; }
+  .fr-item:hover { background: var(--panel-2); }
+  .fr-item .meta { display: block; font-size: 11px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
+    box-shadow: var(--shadow);
+  }
+  .panel h2 {
+    margin: 0 0 14px; font-size: 14px; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel h2 .total { color: var(--text); font-size: 16px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th {
+    text-align: left; padding: 10px 8px; font-weight: 500;
+    color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
+    border-bottom: 1px solid var(--border);
+  }
+  thead th.num { text-align: right; }
+  tbody td {
+    padding: 12px 8px; border-bottom: 1px solid rgba(255,255,255,.04);
+    font-variant-numeric: tabular-nums;
+  }
+  tbody td.num { text-align: right; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.02); }
+  .sym { font-weight: 600; letter-spacing: .3px; }
+  .meta { color: var(--muted); font-size: 12px; }
+
+  .add-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .add-row input, .add-row select {
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 12px; border-radius: 8px; font-size: 13px; min-width: 0;
+  }
+  .add-row input:focus, .add-row select:focus { outline: none; border-color: var(--accent); }
+  .add-row .sym-input { flex: 1 1 140px; text-transform: uppercase; }
+  .add-row .qty-input { flex: 1 1 120px; }
+  .add-row button { flex: 0 0 auto; }
+
+  .empty {
+    text-align: center; padding: 24px 12px; color: var(--muted); font-size: 13px;
+    border: 1px dashed var(--border); border-radius: 10px;
+  }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; padding: 12px 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    color: var(--text); font-size: 13px; box-shadow: var(--shadow);
+    transform: translateY(120%); transition: transform .25s ease;
+    max-width: 320px;
+  }
+  .toast.show { transform: translateY(0); }
+  .toast.error { border-color: var(--red); }
+
+  .footer-note { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid rgba(255,255,255,.2); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 600px) {
+    body { padding: 14px; }
+    .hero-value { font-size: 40px; }
+    thead th.hide-sm, tbody td.hide-sm { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Live Net Worth</h1>
+    <div class="controls">
+      <span class="pill" id="status">Idle</span>
+      <button id="refreshBtn" class="primary">↻ Refresh</button>
+      <button id="exportBtn" title="Export holdings as JSON">⬇ Export</button>
+      <button id="importBtn" title="Import holdings from JSON">⬆ Import</button>
+      <input type="file" id="importFile" accept="application/json" style="display:none" />
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="hero-label">Total Net Worth</div>
+    <div class="hero-value" id="totalValueInr">₹0.00 Cr</div>
+    <div class="hero-value-2" id="totalValueUsd">$0.00 Mn</div>
+    <div class="hero-sub">
+      <span id="lastUpdated">Never updated</span>
+      <span id="totalDay" class="hero-day flat">—</span>
+      <span id="fxPill" class="fx-pill">USD/INR —</span>
+    </div>
+    <div class="breakdown" id="breakdown"></div>
+    <div class="legend">
+      <span class="l-stocks">Stocks <span id="legend-stocks">—</span></span>
+      <span class="l-funds">Mutual Funds <span id="legend-funds">—</span></span>
+      <span class="l-metals">Metals <span id="legend-metals">—</span></span>
+      <span class="l-cash">Cash &amp; Other <span id="legend-cash">—</span></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Stocks &amp; ETFs <span class="total" id="stocksTotal">—</span></h2>
+    <div id="stocksTable"></div>
+    <div class="add-row">
+      <input id="stockSym" class="sym-input" placeholder="Ticker — US: AAPL · NSE: MANAPPURAM.NS · BSE: 531213.BO" />
+      <input id="stockQty" class="qty-input" type="number" step="any" min="0" placeholder="Shares" />
+      <button class="primary" id="addStockBtn">Add holding</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Mutual Funds <span class="total" id="fundsTotal">—</span></h2>
+    <div id="fundsTable"></div>
+    <div class="add-row">
+      <div class="fund-search-wrap">
+        <input id="fundSearch" placeholder="Search Indian MF (e.g. Nippon India Gold Savings Growth)" autocomplete="off" />
+        <div id="fundResults" class="fund-results"></div>
+      </div>
+      <input id="fundUnits" class="qty-input" type="number" step="any" min="0" placeholder="Units" />
+      <button class="primary" id="addFundBtn">Add</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Precious Metals <span class="total" id="metalsTotal">—</span></h2>
+    <div id="metalsTable"></div>
+    <div class="add-row">
+      <select id="metalSym" class="sym-input">
+        <option value="GC=F">Gold (per troy oz)</option>
+        <option value="SI=F">Silver (per troy oz)</option>
+        <option value="PL=F">Platinum (per troy oz)</option>
+        <option value="PA=F">Palladium (per troy oz)</option>
+      </select>
+      <input id="metalQty" class="qty-input" type="number" step="any" min="0" placeholder="Troy ounces" />
+      <button class="primary" id="addMetalBtn">Add holding</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Cash &amp; Other <span class="total" id="cashTotal">—</span></h2>
+    <div id="cashTable"></div>
+    <div class="add-row">
+      <input id="cashLabel" class="sym-input" placeholder="Label (e.g. HDFC Savings, Chase Checking)" />
+      <input id="cashAmt" class="qty-input" type="number" step="any" placeholder="Amount" />
+      <select id="cashCcy" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="INR">INR</option>
+        <option value="USD">USD</option>
+      </select>
+      <button class="primary" id="addCashBtn">Add</button>
+    </div>
+  </section>
+
+  <p class="footer-note">
+    Prices &amp; USD/INR via Yahoo Finance (with proxy fallbacks) · Auto-refresh every 2 min · Cached locally so values persist if a fetch fails.
+  </p>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ------------ Storage ------------
+  const STORAGE_KEY = "netWorthCalcV1";
+  const defaultState = { stocks: [], metals: [], funds: [], cash: [] };
+  let state;
+  try {
+    state = JSON.parse(localStorage.getItem(STORAGE_KEY)) || defaultState;
+    if (!state.stocks) state = defaultState;
+    if (!state.funds) state.funds = []; // migration for older saves
+  } catch (e) {
+    state = defaultState;
+  }
+  const save = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+  // ------------ Price cache (persisted) ------------
+  // ticker -> { price, prevClose, name, currency, ts }
+  const PRICE_CACHE_KEY = "netWorthPriceCacheV1";
+  let prices;
+  try { prices = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY)) || {}; }
+  catch (e) { prices = {}; }
+  const savePrices = () => localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(prices));
+
+  // USD/INR exchange rate (e.g. 83.5 => 1 USD = 83.5 INR). Defaults until first fetch.
+  let usdInr = Number(localStorage.getItem("usdInrRate")) || 83;
+
+  // ------------ Helpers ------------
+  const $ = (id) => document.getElementById(id);
+  const pct = (n) => (n >= 0 ? "+" : "") + n.toFixed(2) + "%";
+
+  // Convert any (amount, ccy) to INR or USD
+  const toINR = (amt, ccy) => ccy === "USD" ? amt * usdInr : amt;
+  const toUSD = (amt, ccy) => ccy === "USD" ? amt : amt / usdInr;
+
+  // Indian numbering: 1 Cr = 1,00,00,000 (10⁷); 1 Lakh = 1,00,000 (10⁵)
+  function fmtCr(inr) {
+    const cr = inr / 1e7;
+    if (Math.abs(cr) >= 1) return "₹" + cr.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " Cr";
+    const lakh = inr / 1e5;
+    if (Math.abs(lakh) >= 1) return "₹" + lakh.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " L";
+    return "₹" + Math.round(inr).toLocaleString("en-IN");
+  }
+  function fmtMn(usd) {
+    const mn = usd / 1e6;
+    if (Math.abs(mn) >= 1) return "$" + mn.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " Mn";
+    const k = usd / 1e3;
+    if (Math.abs(k) >= 1) return "$" + k.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " K";
+    return "$" + Math.round(usd).toLocaleString("en-US");
+  }
+  // Native-currency formatters (per-row prices/values)
+  function fmtNative(amt, ccy) {
+    if (ccy === "INR") return "₹" + (amt || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return "$" + (amt || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  // Combined "₹X Cr / $Y Mn" used in section totals
+  const fmtBoth = (inr) => fmtCr(inr) + " · " + fmtMn(inr / usdInr);
+
+  let toastTimer;
+  function toast(msg, isError) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.classList.toggle("error", !!isError);
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  // ------------ Yahoo Finance fetch ------------
+  // Tries direct first, then falls back through public CORS proxies if blocked/rate-limited.
+  async function fetchYahoo(symbol) {
+    const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d&includePrePost=false`;
+    const targetA = `https://query1.finance.yahoo.com${path}`;
+    const targetB = `https://query2.finance.yahoo.com${path}`;
+    const enc = encodeURIComponent;
+    const urls = [
+      targetA,
+      targetB,
+      `https://corsproxy.io/?url=${enc(targetA)}`,
+      `https://api.allorigins.win/raw?url=${enc(targetA)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${enc(targetA)}`,
+      `https://thingproxy.freeboard.io/fetch/${targetA}`,
+      `https://corsproxy.io/?url=${enc(targetB)}`,
+      `https://api.allorigins.win/raw?url=${enc(targetB)}`
+    ];
+    let lastErr;
+    for (const url of urls) {
+      try {
+        const ctl = new AbortController();
+        const t = setTimeout(() => ctl.abort(), 8000);
+        const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+        clearTimeout(t);
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const j = await r.json();
+        const res = j?.chart?.result?.[0];
+        if (!res) throw new Error(j?.chart?.error?.description || "no result");
+        const meta = res.meta || {};
+        const price = meta.regularMarketPrice ?? meta.previousClose;
+        const prev = meta.chartPreviousClose ?? meta.previousClose ?? price;
+        if (price == null) throw new Error("no price");
+        return {
+          price, prevClose: prev,
+          name: meta.shortName || meta.longName || symbol,
+          currency: meta.currency || "USD",
+          ts: Date.now()
+        };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("fetch failed");
+  }
+
+  // ------------ Mutual Fund NAV (mfapi.in / AMFI) ------------
+  async function fetchFundNav(schemeCode) {
+    const url = `https://api.mfapi.in/mf/${encodeURIComponent(schemeCode)}`;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+    clearTimeout(t);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (j.status !== "SUCCESS" || !j.data || !j.data.length) throw new Error("no NAV");
+    const latest = parseFloat(j.data[0].nav);
+    const prev = j.data[1] ? parseFloat(j.data[1].nav) : latest;
+    return {
+      price: latest, prevClose: prev,
+      name: j.meta?.scheme_name || schemeCode,
+      currency: "INR", ts: Date.now()
+    };
+  }
+
+  async function fetchFundSearch(q) {
+    const r = await fetch("https://api.mfapi.in/mf/search?q=" + encodeURIComponent(q), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }
+
+  // Unified per-symbol fetch — dispatches to the right source.
+  // Symbols starting with "MF:" go to mfapi.in, everything else to Yahoo.
+  function fetchPrice(sym) {
+    if (sym.startsWith("MF:")) return fetchFundNav(sym.slice(3));
+    return fetchYahoo(sym);
+  }
+
+  // Run async tasks with limited concurrency to avoid hammering Yahoo / proxies.
+  async function runLimited(items, limit, worker) {
+    let i = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        await worker(items[idx], idx);
+      }
+    });
+    await Promise.all(runners);
+  }
+
+  let refreshing = false;
+  async function refreshAllPrices() {
+    if (refreshing) return;
+    refreshing = true;
+
+    // Always include INR=X for the FX rate
+    const symbols = [
+      "INR=X",
+      ...state.stocks.map(h => h.symbol),
+      ...state.metals.map(h => h.symbol),
+      ...state.funds.map(h => h.symbol)   // "MF:118566"
+    ];
+    const uniq = [...new Set(symbols)];
+
+    $("status").innerHTML = '<span class="spinner"></span> Updating';
+    $("refreshBtn").disabled = true;
+
+    let okCount = 0;
+    const failed = [];
+
+    // Concurrency 3 — gentle on Yahoo + proxies, fast enough for 10–20 symbols.
+    await runLimited(uniq, 3, async (sym) => {
+      try {
+        const fresh = await fetchPrice(sym);
+        prices[sym] = fresh;          // overwrite with fresh data
+        okCount++;
+      } catch (e) {
+        // Keep the last-known price if we have it; just mark it stale.
+        if (prices[sym] && prices[sym].price != null) {
+          prices[sym].stale = true;
+          prices[sym].lastError = e.message;
+        } else {
+          prices[sym] = { error: e.message };
+        }
+        if (sym !== "INR=X") failed.push(sym);
+      }
+    });
+    savePrices();
+
+    // Update FX
+    const fx = prices["INR=X"];
+    if (fx && fx.price) {
+      usdInr = fx.price;
+      localStorage.setItem("usdInrRate", String(usdInr));
+    }
+
+    // Toast only for symbols we have NO data on at all (truly broken tickers)
+    const totallyMissing = failed.filter((s) => !(prices[s] && prices[s].price != null));
+    if (totallyMissing.length) {
+      toast("Could not fetch: " + totallyMissing.join(", ") + ". Check the ticker.", true);
+    } else if (failed.length) {
+      // We had to fall back to cached values — silent unless persistent.
+      $("status").textContent = "Using cached (rate-limited)";
+    }
+
+    if (!failed.length) $("status").textContent = "Updated";
+    $("refreshBtn").disabled = false;
+    $("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
+    render();
+    refreshing = false;
+  }
+
+  // ------------ Render ------------
+  function holdingValue(h) {
+    const p = prices[h.symbol];
+    if (!p || p.price == null) return { value: null, dayChange: null };
+    const ccy = p.currency || "USD";
+    const valueNative = p.price * h.qty;
+    const dayChangeNative = (p.price - p.prevClose) * h.qty;
+    return {
+      price: p.price, prev: p.prevClose, name: p.name, currency: ccy,
+      valueNative, dayChangeNative,
+      valueINR: toINR(valueNative, ccy),
+      dayChangeINR: toINR(dayChangeNative, ccy)
+    };
+  }
+
+  function renderTable(list, kind) {
+    if (!list.length) {
+      return `<div class="empty">No ${kind} added yet. Add one below.</div>`;
+    }
+    const rows = list.map((h, i) => {
+      const v = holdingValue(h);
+      const ready = v && v.valueNative != null;
+      const stale = prices[h.symbol]?.stale;
+      const staleTag = stale ? ` <span class="meta" title="Cached value — fresh fetch failed">·cached</span>` : "";
+      const priceCell = !ready
+        ? (prices[h.symbol]?.error ? `<span style="color:var(--red)" title="${escapeHtml(prices[h.symbol].error)}">err</span>` : `<span class="meta">…</span>`)
+        : fmtNative(v.price, v.currency) + staleTag;
+      const valCell = !ready ? "—" :
+        `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
+        (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "");
+      const dayPct = ready && v.prev ? ((v.price - v.prev) / v.prev) * 100 : 0;
+      const dayCls = dayPct > 0.0001 ? "up" : dayPct < -0.0001 ? "down" : "flat";
+      const dayCell = !ready ? "—" :
+        `<span class="${dayCls}">${pct(dayPct)}<div class="meta">${v.dayChangeNative >= 0 ? "+" : ""}${fmtNative(v.dayChangeNative, v.currency)}</div></span>`;
+      // Funds: primary label is the fund name; scheme code shown as meta.
+      // Stocks/Metals: ticker is primary, fetched name shown as meta.
+      let primary, secondary;
+      if (kind === "fund") {
+        primary = h.name || (ready ? v.name : h.symbol);
+        secondary = `<div class="meta">${escapeHtml(h.symbol.replace(/^MF:/, "AMFI #"))}</div>`;
+      } else {
+        primary = h.symbol;
+        secondary = ready && v.name && v.name !== h.symbol ? `<div class="meta">${escapeHtml(v.name)}</div>` : "";
+      }
+      return `
+        <tr>
+          <td>
+            <div class="sym">${escapeHtml(primary)}</div>
+            ${secondary}
+          </td>
+          <td class="num">${h.qty}</td>
+          <td class="num hide-sm">${priceCell}</td>
+          <td class="num hide-sm">${dayCell}</td>
+          <td class="num">${valCell}</td>
+          <td class="num"><button class="icon danger" data-del="${kind}:${i}" title="Remove">✕</button></td>
+        </tr>`;
+    }).join("");
+    const headLabel = kind === "fund" ? "Fund" : "Symbol";
+    const qtyLabel  = kind === "fund" ? "Units" : "Qty";
+    const priceLabel = kind === "fund" ? "NAV" : "Price";
+    return `
+      <table>
+        <thead>
+          <tr>
+            <th>${headLabel}</th>
+            <th class="num">${qtyLabel}</th>
+            <th class="num hide-sm">${priceLabel}</th>
+            <th class="num hide-sm">Day</th>
+            <th class="num">Value</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function renderCashTable() {
+    if (!state.cash.length) {
+      return `<div class="empty">No cash or other entries yet.</div>`;
+    }
+    const rows = state.cash.map((c, i) => {
+      const ccy = c.currency || "INR";
+      const inr = toINR(c.amount, ccy);
+      return `
+      <tr>
+        <td><div class="sym">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
+        <td class="num"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}</td>
+        <td class="num"><button class="icon danger" data-del="cash:${i}" title="Remove">✕</button></td>
+      </tr>`;
+    }).join("");
+    return `
+      <table>
+        <thead>
+          <tr><th>Label</th><th class="num">Amount</th><th></th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  function render() {
+    $("stocksTable").innerHTML = renderTable(state.stocks, "stock");
+    $("fundsTable").innerHTML = renderTable(state.funds, "fund");
+    $("metalsTable").innerHTML = renderTable(state.metals, "metal");
+    $("cashTable").innerHTML = renderCashTable();
+
+    // Everything is summed in INR; display in both INR Cr and USD Mn.
+    let stocksINR = 0, metalsINR = 0, fundsINR = 0, cashINR = 0;
+    let stocksDayINR = 0, metalsDayINR = 0, fundsDayINR = 0;
+
+    state.stocks.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) { stocksINR += v.valueINR; stocksDayINR += v.dayChangeINR || 0; }
+    });
+    state.funds.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) { fundsINR += v.valueINR; fundsDayINR += v.dayChangeINR || 0; }
+    });
+    state.metals.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) { metalsINR += v.valueINR; metalsDayINR += v.dayChangeINR || 0; }
+    });
+    state.cash.forEach((c) => {
+      cashINR += toINR(Number(c.amount) || 0, c.currency || "INR");
+    });
+
+    const totalINR = stocksINR + fundsINR + metalsINR + cashINR;
+    const totalUSD = totalINR / usdInr;
+    const dayDeltaINR = stocksDayINR + fundsDayINR + metalsDayINR;
+    const totalPrevINR = totalINR - dayDeltaINR;
+
+    $("stocksTotal").textContent = fmtBoth(stocksINR);
+    $("fundsTotal").textContent = fmtBoth(fundsINR);
+    $("metalsTotal").textContent = fmtBoth(metalsINR);
+    $("cashTotal").textContent = fmtBoth(cashINR);
+    $("totalValueInr").textContent = fmtCr(totalINR);
+    $("totalValueUsd").textContent = fmtMn(totalUSD);
+    $("fxPill").textContent = "USD/INR " + usdInr.toFixed(2);
+
+    $("legend-stocks").textContent = fmtCr(stocksINR);
+    $("legend-funds").textContent = fmtCr(fundsINR);
+    $("legend-metals").textContent = fmtCr(metalsINR);
+    $("legend-cash").textContent = fmtCr(cashINR);
+
+    // Day change pill (in INR)
+    const dayPct = totalPrevINR > 0 ? (dayDeltaINR / totalPrevINR) * 100 : 0;
+    const dayEl = $("totalDay");
+    dayEl.classList.remove("up", "down", "flat");
+    if (Math.abs(dayDeltaINR) < 1) {
+      dayEl.classList.add("flat");
+      dayEl.textContent = "Today: —";
+    } else {
+      dayEl.classList.add(dayDeltaINR >= 0 ? "up" : "down");
+      const sign = dayDeltaINR >= 0 ? "+" : "";
+      dayEl.textContent = `Today: ${sign}${fmtCr(dayDeltaINR)} (${pct(dayPct)})`;
+    }
+
+    // Breakdown bar
+    const bd = $("breakdown");
+    bd.innerHTML = "";
+    if (totalINR > 0) {
+      const seg = (color, val) => {
+        if (val <= 0) return;
+        const d = document.createElement("div");
+        d.style.width = (val / totalINR * 100) + "%";
+        d.style.background = color;
+        bd.appendChild(d);
+      };
+      seg("#6ea8fe", stocksINR);
+      seg("#34d399", fundsINR);
+      seg("var(--gold)", metalsINR);
+      seg("#a78bfa", cashINR);
+    }
+  }
+
+  // ------------ Events ------------
+  $("refreshBtn").addEventListener("click", refreshAllPrices);
+
+  $("addStockBtn").addEventListener("click", () => {
+    const sym = ($("stockSym").value || "").trim().toUpperCase();
+    const qty = parseFloat($("stockQty").value);
+    if (!sym) return toast("Enter a ticker symbol", true);
+    if (!qty || qty <= 0) return toast("Enter a positive share count", true);
+    state.stocks.push({ symbol: sym, qty });
+    save();
+    $("stockSym").value = ""; $("stockQty").value = "";
+    refreshAllPrices();
+  });
+
+  $("addMetalBtn").addEventListener("click", () => {
+    const sym = $("metalSym").value;
+    const qty = parseFloat($("metalQty").value);
+    if (!qty || qty <= 0) return toast("Enter a positive ounce amount", true);
+    state.metals.push({ symbol: sym, qty });
+    save();
+    $("metalQty").value = "";
+    refreshAllPrices();
+  });
+
+  // ------------ Fund search ------------
+  let selectedFund = null;
+  let fundSearchTimer;
+  const fundSearchEl = $("fundSearch");
+  const fundResultsEl = $("fundResults");
+
+  fundSearchEl.addEventListener("input", () => {
+    selectedFund = null;
+    clearTimeout(fundSearchTimer);
+    const q = fundSearchEl.value.trim();
+    if (q.length < 3) { fundResultsEl.classList.remove("show"); return; }
+    fundSearchTimer = setTimeout(async () => {
+      try {
+        const list = await fetchFundSearch(q);
+        if (!list || !list.length) {
+          fundResultsEl.innerHTML = `<div class="fr-item meta">No funds matched "${escapeHtml(q)}"</div>`;
+          fundResultsEl.classList.add("show");
+          return;
+        }
+        fundResultsEl.innerHTML = list.slice(0, 20).map((f) =>
+          `<div class="fr-item" data-code="${f.schemeCode}" data-name="${escapeHtml(f.schemeName)}">
+             ${escapeHtml(f.schemeName)}
+             <span class="meta">AMFI #${f.schemeCode}</span>
+           </div>`
+        ).join("");
+        fundResultsEl.classList.add("show");
+      } catch (e) {
+        fundResultsEl.innerHTML = `<div class="fr-item meta" style="color:var(--red)">Search failed: ${escapeHtml(e.message)}</div>`;
+        fundResultsEl.classList.add("show");
+      }
+    }, 350);
+  });
+
+  fundResultsEl.addEventListener("click", (e) => {
+    const it = e.target.closest(".fr-item");
+    if (!it || !it.dataset.code) return;
+    selectedFund = { schemeCode: it.dataset.code, schemeName: it.dataset.name };
+    fundSearchEl.value = it.dataset.name;
+    fundResultsEl.classList.remove("show");
+    $("fundUnits").focus();
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!fundResultsEl.contains(e.target) && e.target !== fundSearchEl) {
+      fundResultsEl.classList.remove("show");
+    }
+  });
+
+  $("addFundBtn").addEventListener("click", () => {
+    if (!selectedFund) return toast("Search and pick a fund from the list first", true);
+    const units = parseFloat($("fundUnits").value);
+    if (!units || units <= 0) return toast("Enter units", true);
+    state.funds.push({
+      symbol: "MF:" + selectedFund.schemeCode,
+      qty: units,
+      name: selectedFund.schemeName
+    });
+    save();
+    fundSearchEl.value = ""; $("fundUnits").value = ""; selectedFund = null;
+    refreshAllPrices();
+  });
+
+  ["fundUnits"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addFundBtn").click(); }));
+
+  $("addCashBtn").addEventListener("click", () => {
+    const label = ($("cashLabel").value || "").trim();
+    const amt = parseFloat($("cashAmt").value);
+    const currency = $("cashCcy").value || "INR";
+    if (!label) return toast("Enter a label", true);
+    if (isNaN(amt)) return toast("Enter an amount", true);
+    state.cash.push({ label, amount: amt, currency });
+    save();
+    $("cashLabel").value = ""; $("cashAmt").value = "";
+    render();
+  });
+
+  document.body.addEventListener("click", (e) => {
+    const del = e.target.closest("[data-del]");
+    if (!del) return;
+    const [kind, idx] = del.dataset.del.split(":");
+    const i = +idx;
+    if (kind === "stock") state.stocks.splice(i, 1);
+    if (kind === "fund") state.funds.splice(i, 1);
+    if (kind === "metal") state.metals.splice(i, 1);
+    if (kind === "cash") state.cash.splice(i, 1);
+    save();
+    render();
+  });
+
+  // Enter key to submit
+  ["stockSym", "stockQty"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addStockBtn").click(); }));
+  ["metalQty"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addMetalBtn").click(); }));
+  ["cashLabel", "cashAmt"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addCashBtn").click(); }));
+
+  // Export / import
+  $("exportBtn").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "net-worth-holdings.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  $("importBtn").addEventListener("click", () => $("importFile").click());
+  $("importFile").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      const data = JSON.parse(txt);
+      if (!data.stocks || !data.metals || !data.cash) throw new Error("bad format");
+      if (!data.funds) data.funds = [];
+      state = data;
+      save();
+      toast("Holdings imported");
+      refreshAllPrices();
+    } catch (err) {
+      toast("Import failed: " + err.message, true);
+    }
+    e.target.value = "";
+  });
+
+  // Initial render + start refresh loop. 2 minutes is friendly on Yahoo/proxies
+  // while still feeling live; cached prices fill the gap.
+  render();
+  refreshAllPrices();
+  setInterval(refreshAllPrices, 120_000);
+
+  // Re-fetch when tab becomes visible again, but at most once every 30s.
+  let lastFocusFetch = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    const now = Date.now();
+    if (now - lastFocusFetch < 30_000) return;
+    lastFocusFetch = now;
+    refreshAllPrices();
+  });
+})();
+</script>
+</body>
+</html>
