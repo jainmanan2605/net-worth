@@ -388,7 +388,11 @@
         <option value="PL=F">Platinum (per troy oz)</option>
         <option value="PA=F">Palladium (per troy oz)</option>
       </select>
-      <input id="metalQty" class="qty-input" type="number" step="any" min="0" placeholder="Troy ounces" />
+      <input id="metalQty" class="qty-input" type="number" step="any" min="0" placeholder="Quantity" />
+      <select id="metalUnit" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="oz">troy oz</option>
+        <option value="gm">grams</option>
+      </select>
       <button class="primary" id="addMetalBtn">Add holding</button>
     </div>
   </section>
@@ -503,6 +507,12 @@
   }
   // Combined "₹X Cr / $Y Mn" used in section totals
   const fmtBoth = (inr) => fmtCr(inr) + " · " + fmtMn(inr / usdInr);
+
+  // Ounce ↔ gram (precious metals) — using user-specified 28.35
+  const OZ_TO_GM = 28.35;
+  const ozToGm = (oz) => oz * OZ_TO_GM;
+  const gmToOz = (gm) => gm / OZ_TO_GM;
+  const fmtGm = (gm) => (gm >= 1000 ? gm.toLocaleString("en-IN", { maximumFractionDigits: 1 }) : gm.toFixed(2)) + " g";
 
   let toastTimer;
   function toast(msg, isError) {
@@ -746,7 +756,10 @@
             <div class="sym">${escapeHtml(primary)}</div>
             ${secondary}
           </td>
-          <td class="num editable" data-edit-qty="${kind}:${i}" title="Click to edit ${kind === "fund" ? "units" : "qty"}">${h.qty}</td>
+          <td class="num">
+            <span class="editable" data-edit-qty="${kind}:${i}" title="Click to edit ${kind === "fund" ? "units" : kind === "metal" ? "troy oz" : "qty"}">${h.qty}${kind === "metal" ? " oz" : ""}</span>
+            ${kind === "metal" ? `<div class="meta editable" data-edit-gm="${i}" title="Click to edit (grams)">${fmtGm(ozToGm(h.qty))}</div>` : ""}
+          </td>
           <td class="num hide-sm">${priceCell}</td>
           ${buyCell}
           <td class="num hide-sm">${dayCell}</td>
@@ -1019,6 +1032,22 @@
       return;
     }
 
+    // 2b. Grams (metals only — converts to troy oz internally)
+    const gmCell = e.target.closest("[data-edit-gm]");
+    if (gmCell) {
+      const i = +gmCell.dataset.editGm;
+      const h = state.metals[i];
+      if (!h) return;
+      const curGm = ozToGm(h.qty).toFixed(3);
+      const next = window.prompt(`Weight in grams for ${h.symbol}:`, curGm);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v) || v <= 0) return toast("Invalid grams", true);
+      h.qty = gmToOz(v);
+      save(); render();
+      return;
+    }
+
     // 3. Amount (cash, debt)
     const amtCell = e.target.closest("[data-edit-amt]");
     if (amtCell) {
@@ -1038,8 +1067,10 @@
 
   $("addMetalBtn").addEventListener("click", () => {
     const sym = $("metalSym").value;
-    const qty = parseFloat($("metalQty").value);
-    if (!qty || qty <= 0) return toast("Enter a positive ounce amount", true);
+    const raw = parseFloat($("metalQty").value);
+    const unit = $("metalUnit").value;
+    if (!raw || raw <= 0) return toast("Enter a positive quantity", true);
+    const qty = unit === "gm" ? gmToOz(raw) : raw;     // store internally as troy oz
     state.metals.push({ symbol: sym, qty });
     save();
     $("metalQty").value = "";
