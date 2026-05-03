@@ -111,9 +111,57 @@
     border-radius: 3px; margin-right: 6px; vertical-align: middle;
   }
   .legend .l-stocks::before { background: #6ea8fe; }
-  .legend .l-metals::before { background: var(--gold); }
   .legend .l-funds::before { background: #34d399; }
+  .legend .l-debt::before { background: #f59e0b; }
+  .legend .l-metals::before { background: var(--gold); }
   .legend .l-cash::before { background: #a78bfa; }
+
+  /* Per-section % badge in heading */
+  .section-pct {
+    display: inline-block;
+    padding: 2px 8px; margin-left: 8px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 11px; font-weight: 500;
+    border-radius: 6px; letter-spacing: 0;
+    font-variant-numeric: tabular-nums;
+    text-transform: none;
+  }
+
+  /* Per-row pct line and editable cells */
+  .pct-line {
+    display: block; color: var(--muted); font-size: 11px; margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  .buy-cell { cursor: pointer; }
+  .buy-cell:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .buy-set { color: var(--muted); font-style: italic; }
+
+  /* Tax + section meta */
+  .tax-caption {
+    color: var(--muted); font-size: 12px; margin-top: 8px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .tax-caption input.rate {
+    background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text);
+    padding: 2px 6px; border-radius: 4px; width: 54px; font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tax-caption input.rate:focus { outline: none; border-color: var(--accent); }
+
+  .section-meta {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: -8px 0 12px; font-size: 12px; color: var(--muted);
+  }
+  .section-meta input {
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; width: 160px;
+    font-variant-numeric: tabular-nums;
+  }
+  .section-meta input:focus { outline: none; border-color: var(--accent); }
+  .gain-up { color: var(--green); }
+  .gain-down { color: var(--red); }
 
   /* Fund search dropdown */
   .fund-search-wrap { flex: 1 1 280px; position: relative; }
@@ -229,21 +277,33 @@
       <span class="l-funds">Mutual Funds <span id="legend-funds">—</span></span>
       <span class="l-metals">Metals <span id="legend-metals">—</span></span>
       <span class="l-cash">Cash &amp; Other <span id="legend-cash">—</span></span>
+      <span class="l-debt">Debt <span id="legend-debt">—</span></span>
+    </div>
+    <div class="tax-caption">
+      <span id="taxText">Net of est. LTCG: —</span>
+      <span>·</span>
+      <span>Rate <input id="taxRate" class="rate" type="number" step="0.5" min="0" max="50" /> %</span>
     </div>
   </section>
 
   <section class="panel">
-    <h2>Stocks &amp; ETFs <span class="total" id="stocksTotal">—</span></h2>
+    <h2><span>Stocks &amp; ETFs <span class="section-pct" id="stocksPct">—</span></span> <span class="total" id="stocksTotal">—</span></h2>
     <div id="stocksTable"></div>
     <div class="add-row">
       <input id="stockSym" class="sym-input" placeholder="Ticker — US: AAPL · NSE: MANAPPURAM.NS · BSE: 531213.BO" />
       <input id="stockQty" class="qty-input" type="number" step="any" min="0" placeholder="Shares" />
+      <input id="stockBuy" class="qty-input" type="number" step="any" min="0" placeholder="Avg buy price (optional)" />
       <button class="primary" id="addStockBtn">Add holding</button>
     </div>
   </section>
 
   <section class="panel">
-    <h2>Mutual Funds <span class="total" id="fundsTotal">—</span></h2>
+    <h2><span>Mutual Funds <span class="section-pct" id="fundsPct">—</span></span> <span class="total" id="fundsTotal">—</span></h2>
+    <div class="section-meta">
+      <label for="fundsPurchase">Total invested (₹):</label>
+      <input id="fundsPurchase" type="number" step="any" min="0" placeholder="e.g. 1500000" />
+      <span id="fundsGain">—</span>
+    </div>
     <div id="fundsTable"></div>
     <div class="add-row">
       <div class="fund-search-wrap">
@@ -256,7 +316,7 @@
   </section>
 
   <section class="panel">
-    <h2>Precious Metals <span class="total" id="metalsTotal">—</span></h2>
+    <h2><span>Precious Metals <span class="section-pct" id="metalsPct">—</span></span> <span class="total" id="metalsTotal">—</span></h2>
     <div id="metalsTable"></div>
     <div class="add-row">
       <select id="metalSym" class="sym-input">
@@ -271,7 +331,7 @@
   </section>
 
   <section class="panel">
-    <h2>Cash &amp; Other <span class="total" id="cashTotal">—</span></h2>
+    <h2><span>Cash &amp; Other <span class="section-pct" id="cashPct">—</span></span> <span class="total" id="cashTotal">—</span></h2>
     <div id="cashTable"></div>
     <div class="add-row">
       <input id="cashLabel" class="sym-input" placeholder="Label (e.g. HDFC Savings, Chase Checking)" />
@@ -281,6 +341,20 @@
         <option value="USD">USD</option>
       </select>
       <button class="primary" id="addCashBtn">Add</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Debt <span class="section-pct" id="debtPct">—</span></span> <span class="total" id="debtTotal">—</span></h2>
+    <div id="debtTable"></div>
+    <div class="add-row">
+      <input id="debtLabel" class="sym-input" placeholder="Label (e.g. HDFC FD 7.1%, PPF, NPS Tier 1, GoI Bond)" />
+      <input id="debtAmt" class="qty-input" type="number" step="any" placeholder="Amount" />
+      <select id="debtCcy" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="INR">INR</option>
+        <option value="USD">USD</option>
+      </select>
+      <button class="primary" id="addDebtBtn">Add</button>
     </div>
   </section>
 
@@ -297,12 +371,19 @@
 
   // ------------ Storage ------------
   const STORAGE_KEY = "netWorthCalcV1";
-  const defaultState = { stocks: [], metals: [], funds: [], cash: [] };
+  const defaultState = {
+    stocks: [], metals: [], funds: [], debt: [], cash: [],
+    fundsPurchase: 0,   // total INR invested across all mutual funds (single number)
+    taxRate: 15         // %, editable LTCG rate applied to net stock + fund gain
+  };
   let state;
   try {
     state = JSON.parse(localStorage.getItem(STORAGE_KEY)) || defaultState;
     if (!state.stocks) state = defaultState;
-    if (!state.funds) state.funds = []; // migration for older saves
+    if (!state.funds) state.funds = [];
+    if (!state.debt) state.debt = [];                // migration for older saves
+    if (state.fundsPurchase == null) state.fundsPurchase = 0;
+    if (state.taxRate == null) state.taxRate = 15;
   } catch (e) {
     state = defaultState;
   }
@@ -518,18 +599,26 @@
     const ccy = p.currency || "USD";
     const valueNative = p.price * h.qty;
     const dayChangeNative = (p.price - p.prevClose) * h.qty;
+    // Unrealized gain (INR), only if purchase price is known on the holding.
+    let gainINR = null;
+    if (h.purchasePrice != null && h.purchasePrice > 0) {
+      const gainNative = (p.price - h.purchasePrice) * h.qty;
+      gainINR = toINR(gainNative, ccy);
+    }
     return {
       price: p.price, prev: p.prevClose, name: p.name, currency: ccy,
       valueNative, dayChangeNative,
       valueINR: toINR(valueNative, ccy),
-      dayChangeINR: toINR(dayChangeNative, ccy)
+      dayChangeINR: toINR(dayChangeNative, ccy),
+      gainINR
     };
   }
 
-  function renderTable(list, kind) {
+  function renderTable(list, kind, sectionINR, grandINR) {
     if (!list.length) {
       return `<div class="empty">No ${kind} added yet. Add one below.</div>`;
     }
+    const isStock = kind === "stock";
     const rows = list.map((h, i) => {
       const v = holdingValue(h);
       const ready = v && v.valueNative != null;
@@ -538,15 +627,38 @@
       const priceCell = !ready
         ? (prices[h.symbol]?.error ? `<span style="color:var(--red)" title="${escapeHtml(prices[h.symbol].error)}">err</span>` : `<span class="meta">…</span>`)
         : fmtNative(v.price, v.currency) + staleTag;
+
+      // Per-row percentages
+      let pctLine = "";
+      if (ready) {
+        const sectShare = sectionINR > 0 ? (v.valueINR / sectionINR * 100) : 0;
+        const totalShare = grandINR > 0 ? (v.valueINR / grandINR * 100) : 0;
+        const sectLabel = kind === "stock" ? "stocks" : kind === "fund" ? "funds" : "metals";
+        pctLine = `<span class="pct-line">${sectShare.toFixed(1)}% of ${sectLabel} · ${totalShare.toFixed(1)}% of total</span>`;
+      }
       const valCell = !ready ? "—" :
         `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
-        (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "");
+        (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "") +
+        pctLine;
+
       const dayPct = ready && v.prev ? ((v.price - v.prev) / v.prev) * 100 : 0;
       const dayCls = dayPct > 0.0001 ? "up" : dayPct < -0.0001 ? "down" : "flat";
       const dayCell = !ready ? "—" :
         `<span class="${dayCls}">${pct(dayPct)}<div class="meta">${v.dayChangeNative >= 0 ? "+" : ""}${fmtNative(v.dayChangeNative, v.currency)}</div></span>`;
-      // Funds: primary label is the fund name; scheme code shown as meta.
-      // Stocks/Metals: ticker is primary, fetched name shown as meta.
+
+      // Buy price cell (stocks only) — click to edit
+      let buyCell = "";
+      if (isStock) {
+        if (h.purchasePrice != null && h.purchasePrice > 0) {
+          const gainHtml = ready && v.gainINR != null
+            ? `<div class="pct-line ${v.gainINR >= 0 ? "gain-up" : "gain-down"}">${v.gainINR >= 0 ? "+" : ""}${fmtCr(v.gainINR)}</div>`
+            : "";
+          buyCell = `<td class="num hide-sm buy-cell" data-edit-buy="${i}">${fmtNative(h.purchasePrice, ready ? v.currency : "INR")}${gainHtml}</td>`;
+        } else {
+          buyCell = `<td class="num hide-sm buy-cell buy-set" data-edit-buy="${i}">set</td>`;
+        }
+      }
+
       let primary, secondary;
       if (kind === "fund") {
         primary = h.name || (ready ? v.name : h.symbol);
@@ -563,6 +675,7 @@
           </td>
           <td class="num">${h.qty}</td>
           <td class="num hide-sm">${priceCell}</td>
+          ${buyCell}
           <td class="num hide-sm">${dayCell}</td>
           <td class="num">${valCell}</td>
           <td class="num"><button class="icon danger" data-del="${kind}:${i}" title="Remove">✕</button></td>
@@ -571,6 +684,7 @@
     const headLabel = kind === "fund" ? "Fund" : "Symbol";
     const qtyLabel  = kind === "fund" ? "Units" : "Qty";
     const priceLabel = kind === "fund" ? "NAV" : "Price";
+    const buyHead = isStock ? `<th class="num hide-sm">Buy</th>` : "";
     return `
       <table>
         <thead>
@@ -578,6 +692,7 @@
             <th>${headLabel}</th>
             <th class="num">${qtyLabel}</th>
             <th class="num hide-sm">${priceLabel}</th>
+            ${buyHead}
             <th class="num hide-sm">Day</th>
             <th class="num">Value</th>
             <th></th>
@@ -587,18 +702,26 @@
       </table>`;
   }
 
-  function renderCashTable() {
-    if (!state.cash.length) {
-      return `<div class="empty">No cash or other entries yet.</div>`;
+  // Used for both cash and debt — same shape (label, amount, currency).
+  function renderManualTable(entries, kindKey, sectionINR, grandINR) {
+    const sectLabel = kindKey;   // "cash" or "debt"
+    const emptyMsg = kindKey === "debt"
+      ? "No debt holdings yet. Add an FD, PPF, NPS, or bond below."
+      : "No cash or other entries yet.";
+    if (!entries.length) {
+      return `<div class="empty">${emptyMsg}</div>`;
     }
-    const rows = state.cash.map((c, i) => {
+    const rows = entries.map((c, i) => {
       const ccy = c.currency || "INR";
       const inr = toINR(c.amount, ccy);
+      const sectShare = sectionINR > 0 ? (inr / sectionINR * 100) : 0;
+      const totalShare = grandINR > 0 ? (inr / grandINR * 100) : 0;
+      const pctLine = `<span class="pct-line">${sectShare.toFixed(1)}% of ${sectLabel} · ${totalShare.toFixed(1)}% of total</span>`;
       return `
       <tr>
         <td><div class="sym">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
-        <td class="num"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}</td>
-        <td class="num"><button class="icon danger" data-del="cash:${i}" title="Remove">✕</button></td>
+        <td class="num"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}</td>
+        <td class="num"><button class="icon danger" data-del="${kindKey}:${i}" title="Remove">✕</button></td>
       </tr>`;
     }).join("");
     return `
@@ -617,18 +740,18 @@
   }
 
   function render() {
-    $("stocksTable").innerHTML = renderTable(state.stocks, "stock");
-    $("fundsTable").innerHTML = renderTable(state.funds, "fund");
-    $("metalsTable").innerHTML = renderTable(state.metals, "metal");
-    $("cashTable").innerHTML = renderCashTable();
-
-    // Everything is summed in INR; display in both INR Cr and USD Mn.
-    let stocksINR = 0, metalsINR = 0, fundsINR = 0, cashINR = 0;
+    // ---- 1. Sum everything in INR up-front (so per-row %s can use it) ----
+    let stocksINR = 0, metalsINR = 0, fundsINR = 0, debtINR = 0, cashINR = 0;
     let stocksDayINR = 0, metalsDayINR = 0, fundsDayINR = 0;
+    let stocksGainINR = 0;   // net unrealized gain across stocks (where buy price set)
 
     state.stocks.forEach((h) => {
       const v = holdingValue(h);
-      if (v.valueINR != null) { stocksINR += v.valueINR; stocksDayINR += v.dayChangeINR || 0; }
+      if (v.valueINR != null) {
+        stocksINR += v.valueINR;
+        stocksDayINR += v.dayChangeINR || 0;
+        if (v.gainINR != null) stocksGainINR += v.gainINR;   // signed; can be negative
+      }
     });
     state.funds.forEach((h) => {
       const v = holdingValue(h);
@@ -638,17 +761,40 @@
       const v = holdingValue(h);
       if (v.valueINR != null) { metalsINR += v.valueINR; metalsDayINR += v.dayChangeINR || 0; }
     });
+    state.debt.forEach((c) => {
+      debtINR += toINR(Number(c.amount) || 0, c.currency || "INR");
+    });
     state.cash.forEach((c) => {
       cashINR += toINR(Number(c.amount) || 0, c.currency || "INR");
     });
 
-    const totalINR = stocksINR + fundsINR + metalsINR + cashINR;
+    const grossTotalINR = stocksINR + fundsINR + debtINR + metalsINR + cashINR;
+
+    // ---- 2. LTCG provisioning (discreet) ----
+    // Net stocks (gains - losses), net funds (current value - total invested).
+    // Tax only the positive of stocks-net + funds-net combined.
+    const fundsGainINR = state.fundsPurchase > 0 ? (fundsINR - Number(state.fundsPurchase)) : 0;
+    const totalGainINR = stocksGainINR + fundsGainINR;
+    const taxRate = Math.max(0, Math.min(50, Number(state.taxRate) || 0));
+    const ltcgTaxINR = totalGainINR > 0 ? (totalGainINR * taxRate / 100) : 0;
+
+    // ---- 3. After-tax NW (the headline number) ----
+    const totalINR = grossTotalINR - ltcgTaxINR;
     const totalUSD = totalINR / usdInr;
     const dayDeltaINR = stocksDayINR + fundsDayINR + metalsDayINR;
-    const totalPrevINR = totalINR - dayDeltaINR;
+    const totalPrevINR = grossTotalINR - dayDeltaINR;   // gross prev for % calc; tax shifts both sides
 
+    // ---- 4. Render tables now that we have section + grand totals ----
+    $("stocksTable").innerHTML = renderTable(state.stocks, "stock", stocksINR, grossTotalINR);
+    $("fundsTable").innerHTML = renderTable(state.funds, "fund", fundsINR, grossTotalINR);
+    $("metalsTable").innerHTML = renderTable(state.metals, "metal", metalsINR, grossTotalINR);
+    $("debtTable").innerHTML = renderManualTable(state.debt, "debt", debtINR, grossTotalINR);
+    $("cashTable").innerHTML = renderManualTable(state.cash, "cash", cashINR, grossTotalINR);
+
+    // ---- 5. Header / legend / totals ----
     $("stocksTotal").textContent = fmtBoth(stocksINR);
     $("fundsTotal").textContent = fmtBoth(fundsINR);
+    $("debtTotal").textContent = fmtBoth(debtINR);
     $("metalsTotal").textContent = fmtBoth(metalsINR);
     $("cashTotal").textContent = fmtBoth(cashINR);
     $("totalValueInr").textContent = fmtCr(totalINR);
@@ -657,8 +803,41 @@
 
     $("legend-stocks").textContent = fmtCr(stocksINR);
     $("legend-funds").textContent = fmtCr(fundsINR);
+    $("legend-debt").textContent = fmtCr(debtINR);
     $("legend-metals").textContent = fmtCr(metalsINR);
     $("legend-cash").textContent = fmtCr(cashINR);
+
+    // ---- 5b. Per-section % of total badges in section headers ----
+    const setPct = (id, val) => {
+      const p = grossTotalINR > 0 ? (val / grossTotalINR * 100) : 0;
+      $(id).textContent = p.toFixed(1) + "% of total";
+    };
+    setPct("stocksPct", stocksINR);
+    setPct("fundsPct", fundsINR);
+    setPct("debtPct", debtINR);
+    setPct("metalsPct", metalsINR);
+    setPct("cashPct", cashINR);
+
+    // ---- 6. Discreet tax caption + tax rate input value ----
+    if ($("taxRate") !== document.activeElement) {
+      $("taxRate").value = taxRate;
+    }
+    $("taxText").textContent = ltcgTaxINR > 0
+      ? `Net of est. LTCG: −${fmtCr(ltcgTaxINR)}`
+      : "Net of est. LTCG: —";
+
+    // Funds gain text next to total invested input
+    if (state.fundsPurchase > 0) {
+      const sign = fundsGainINR >= 0 ? "+" : "";
+      const cls = fundsGainINR >= 0 ? "gain-up" : "gain-down";
+      const pctG = state.fundsPurchase > 0 ? (fundsGainINR / state.fundsPurchase * 100) : 0;
+      $("fundsGain").innerHTML = `→ Gain: <span class="${cls}">${sign}${fmtCr(fundsGainINR)} (${pctG >= 0 ? "+" : ""}${pctG.toFixed(2)}%)</span>`;
+    } else {
+      $("fundsGain").textContent = "";
+    }
+    if ($("fundsPurchase") !== document.activeElement) {
+      $("fundsPurchase").value = state.fundsPurchase || "";
+    }
 
     // Day change pill (in INR)
     const dayPct = totalPrevINR > 0 ? (dayDeltaINR / totalPrevINR) * 100 : 0;
@@ -673,14 +852,14 @@
       dayEl.textContent = `Today: ${sign}${fmtCr(dayDeltaINR)} (${pct(dayPct)})`;
     }
 
-    // Breakdown bar
+    // Breakdown bar — gross totals (the bar sums section totals, not after-tax NW)
     const bd = $("breakdown");
     bd.innerHTML = "";
-    if (totalINR > 0) {
+    if (grossTotalINR > 0) {
       const seg = (color, val) => {
         if (val <= 0) return;
         const d = document.createElement("div");
-        d.style.width = (val / totalINR * 100) + "%";
+        d.style.width = (val / grossTotalINR * 100) + "%";
         d.style.background = color;
         bd.appendChild(d);
       };
@@ -688,6 +867,7 @@
       seg("#34d399", fundsINR);
       seg("var(--gold)", metalsINR);
       seg("#a78bfa", cashINR);
+      seg("#f59e0b", debtINR);
     }
   }
 
@@ -697,12 +877,53 @@
   $("addStockBtn").addEventListener("click", () => {
     const sym = ($("stockSym").value || "").trim().toUpperCase();
     const qty = parseFloat($("stockQty").value);
+    const buyRaw = $("stockBuy").value;
+    const buy = buyRaw === "" ? null : parseFloat(buyRaw);
     if (!sym) return toast("Enter a ticker symbol", true);
     if (!qty || qty <= 0) return toast("Enter a positive share count", true);
-    state.stocks.push({ symbol: sym, qty });
+    if (buy != null && (isNaN(buy) || buy < 0)) return toast("Invalid purchase price", true);
+    const entry = { symbol: sym, qty };
+    if (buy != null && buy > 0) entry.purchasePrice = buy;
+    state.stocks.push(entry);
     save();
-    $("stockSym").value = ""; $("stockQty").value = "";
+    $("stockSym").value = ""; $("stockQty").value = ""; $("stockBuy").value = "";
     refreshAllPrices();
+  });
+
+  // Tax rate input — debounced save
+  $("taxRate").addEventListener("input", () => {
+    const v = parseFloat($("taxRate").value);
+    state.taxRate = isNaN(v) ? 0 : Math.max(0, Math.min(50, v));
+    save();
+    render();
+  });
+
+  // Funds purchase value — debounced save
+  $("fundsPurchase").addEventListener("input", () => {
+    const v = parseFloat($("fundsPurchase").value);
+    state.fundsPurchase = isNaN(v) ? 0 : Math.max(0, v);
+    save();
+    render();
+  });
+
+  // Click-to-edit stock purchase price (uses prompt for simplicity)
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-buy]");
+    if (!cell) return;
+    const idx = +cell.dataset.editBuy;
+    const h = state.stocks[idx];
+    if (!h) return;
+    const cur = h.purchasePrice != null ? h.purchasePrice : "";
+    const next = window.prompt(
+      `Average purchase price for ${h.symbol} (in its native currency, blank to clear):`,
+      cur
+    );
+    if (next === null) return;
+    if (next.trim() === "") { delete h.purchasePrice; save(); render(); return; }
+    const v = parseFloat(next);
+    if (isNaN(v) || v < 0) return toast("Invalid number", true);
+    h.purchasePrice = v;
+    save(); render();
   });
 
   $("addMetalBtn").addEventListener("click", () => {
@@ -791,6 +1012,18 @@
     render();
   });
 
+  $("addDebtBtn").addEventListener("click", () => {
+    const label = ($("debtLabel").value || "").trim();
+    const amt = parseFloat($("debtAmt").value);
+    const currency = $("debtCcy").value || "INR";
+    if (!label) return toast("Enter a label", true);
+    if (isNaN(amt)) return toast("Enter an amount", true);
+    state.debt.push({ label, amount: amt, currency });
+    save();
+    $("debtLabel").value = ""; $("debtAmt").value = "";
+    render();
+  });
+
   document.body.addEventListener("click", (e) => {
     const del = e.target.closest("[data-del]");
     if (!del) return;
@@ -799,15 +1032,17 @@
     if (kind === "stock") state.stocks.splice(i, 1);
     if (kind === "fund") state.funds.splice(i, 1);
     if (kind === "metal") state.metals.splice(i, 1);
+    if (kind === "debt") state.debt.splice(i, 1);
     if (kind === "cash") state.cash.splice(i, 1);
     save();
     render();
   });
 
   // Enter key to submit
-  ["stockSym", "stockQty"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addStockBtn").click(); }));
+  ["stockSym", "stockQty", "stockBuy"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addStockBtn").click(); }));
   ["metalQty"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addMetalBtn").click(); }));
   ["cashLabel", "cashAmt"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addCashBtn").click(); }));
+  ["debtLabel", "debtAmt"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addDebtBtn").click(); }));
 
   // Export / import
   $("exportBtn").addEventListener("click", () => {
@@ -827,6 +1062,7 @@
       const data = JSON.parse(txt);
       if (!data.stocks || !data.metals || !data.cash) throw new Error("bad format");
       if (!data.funds) data.funds = [];
+      if (!data.debt) data.debt = [];
       state = data;
       save();
       toast("Holdings imported");
