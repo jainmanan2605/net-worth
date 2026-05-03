@@ -134,8 +134,8 @@
     display: block; color: var(--muted); font-size: 11px; margin-top: 2px;
     font-variant-numeric: tabular-nums;
   }
-  .buy-cell { cursor: pointer; }
-  .buy-cell:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .buy-cell, .editable { cursor: pointer; }
+  .buy-cell:hover, .editable:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
   .buy-set { color: var(--muted); font-style: italic; }
 
   /* Tax + section meta */
@@ -746,7 +746,7 @@
             <div class="sym">${escapeHtml(primary)}</div>
             ${secondary}
           </td>
-          <td class="num">${h.qty}</td>
+          <td class="num editable" data-edit-qty="${kind}:${i}" title="Click to edit ${kind === "fund" ? "units" : "qty"}">${h.qty}</td>
           <td class="num hide-sm">${priceCell}</td>
           ${buyCell}
           <td class="num hide-sm">${dayCell}</td>
@@ -793,7 +793,7 @@
       return `
       <tr>
         <td><div class="sym">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
-        <td class="num"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}</td>
+        <td class="num editable" data-edit-amt="${kindKey}:${i}" title="Click to edit amount"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}</td>
         <td class="num"><button class="icon danger" data-del="${kindKey}:${i}" title="Remove">✕</button></td>
       </tr>`;
     }).join("");
@@ -979,24 +979,61 @@
     render();
   });
 
-  // Click-to-edit stock purchase price (uses prompt for simplicity)
+  // Click-to-edit (purchase price + qty/units + amount). All use prompt for simplicity.
   document.body.addEventListener("click", (e) => {
-    const cell = e.target.closest("[data-edit-buy]");
-    if (!cell) return;
-    const idx = +cell.dataset.editBuy;
-    const h = state.stocks[idx];
-    if (!h) return;
-    const cur = h.purchasePrice != null ? h.purchasePrice : "";
-    const next = window.prompt(
-      `Average purchase price for ${h.symbol} (in its native currency, blank to clear):`,
-      cur
-    );
-    if (next === null) return;
-    if (next.trim() === "") { delete h.purchasePrice; save(); render(); return; }
-    const v = parseFloat(next);
-    if (isNaN(v) || v < 0) return toast("Invalid number", true);
-    h.purchasePrice = v;
-    save(); render();
+    // 1. Stock purchase price
+    const buyCell = e.target.closest("[data-edit-buy]");
+    if (buyCell) {
+      const idx = +buyCell.dataset.editBuy;
+      const h = state.stocks[idx];
+      if (!h) return;
+      const cur = h.purchasePrice != null ? h.purchasePrice : "";
+      const next = window.prompt(
+        `Average purchase price for ${h.symbol} (in its native currency, blank to clear):`,
+        cur
+      );
+      if (next === null) return;
+      if (next.trim() === "") { delete h.purchasePrice; save(); render(); return; }
+      const v = parseFloat(next);
+      if (isNaN(v) || v < 0) return toast("Invalid number", true);
+      h.purchasePrice = v;
+      save(); render();
+      return;
+    }
+
+    // 2. Qty / units (stocks, funds, metals)
+    const qtyCell = e.target.closest("[data-edit-qty]");
+    if (qtyCell) {
+      const [kind, i] = qtyCell.dataset.editQty.split(":");
+      const list = kind === "stock" ? state.stocks : kind === "fund" ? state.funds : state.metals;
+      const h = list[+i];
+      if (!h) return;
+      const label = kind === "fund" ? "units" : kind === "metal" ? "troy ounces" : "shares";
+      const niceName = kind === "fund" ? (h.name || h.symbol.replace(/^MF:/, "AMFI #")) : h.symbol;
+      const next = window.prompt(`New ${label} for ${niceName}:`, h.qty);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v) || v <= 0) return toast(`Invalid ${label}`, true);
+      h.qty = v;
+      save(); render();
+      return;
+    }
+
+    // 3. Amount (cash, debt)
+    const amtCell = e.target.closest("[data-edit-amt]");
+    if (amtCell) {
+      const [kind, i] = amtCell.dataset.editAmt.split(":");
+      const list = kind === "cash" ? state.cash : state.debt;
+      const c = list[+i];
+      if (!c) return;
+      const next = window.prompt(`New amount for "${c.label}" (${c.currency || "INR"}):`, c.amount);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v)) return toast("Invalid amount", true);
+      c.amount = v;
+      save(); render();
+      return;
+    }
   });
 
   $("addMetalBtn").addEventListener("click", () => {
