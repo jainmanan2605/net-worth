@@ -119,6 +119,22 @@
     display: inline-block; margin-top: 10px; padding: 3px 9px;
     border-radius: 6px; font-size: 13px; font-weight: 600;
   }
+  /* Free-text horizon: "by FY28" */
+  .proj-by { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .proj-by-label { margin-right: 4px; }
+  .proj-by-value {
+    color: var(--text); font-weight: 600;
+    border-bottom: 1px dashed var(--border); padding-bottom: 1px;
+  }
+  .proj-by-value:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  .proj-by-value.unset { color: var(--muted); font-weight: 400; font-style: italic; }
+  .proj-by .label-edit { max-width: 160px; font-size: 13px; }
+
+  /* Annualised rate implied by the horizon */
+  .proj-irr { margin-top: 8px; }
+  .irr-rate { display: block; font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .irr-basis { display: block; color: var(--muted); font-size: 11.5px; margin-top: 3px; line-height: 1.5; }
+
   .proj-note { display: block; color: var(--muted); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
   .proj-clear {
     margin-top: 12px; padding: 5px 10px; font-size: 12px;
@@ -429,6 +445,12 @@
         <div class="proj-value" id="projValueInr">—</div>
         <div class="proj-usd" id="projValueUsd">—</div>
         <div><span class="proj-delta flat" id="projDelta">—</span></div>
+        <div class="proj-by">
+          <span class="proj-by-label">by</span>
+          <span class="proj-by-value editable" id="projHorizon" data-edit-horizon
+                title="Click to set when you aim to reach this">—</span>
+        </div>
+        <div class="proj-irr" id="projIrr"></div>
         <span class="proj-note" id="projNote"></span>
         <button class="proj-clear" id="clearTargetsBtn">Clear all targets</button>
       </div>
@@ -541,6 +563,7 @@
   const defaultState = {
     stocks: [], metals: [], funds: [], debt: [], cash: [],
     fundsPurchase: 0,   // total INR invested across all mutual funds (single number)
+    horizon: "",        // free text: when you aim to reach the potential, e.g. "FY28"
     taxRate: 15,        // %, editable LTCG rate applied to net stock + fund gain
     updatedAt: 0        // ms epoch — bumped on every save() and used for sync conflict resolution
   };
@@ -551,6 +574,7 @@
     if (!state.funds) state.funds = [];
     if (!state.debt) state.debt = [];                // migration for older saves
     if (state.fundsPurchase == null) state.fundsPurchase = 0;
+    if (state.horizon == null) state.horizon = "";
     if (state.taxRate == null) state.taxRate = 15;
     if (state.updatedAt == null) state.updatedAt = 0;
   } catch (e) {
@@ -804,6 +828,70 @@
   // scenario reads as "these move, everything else holds".
 
   const hasTarget = (h) => h && h.target != null && !isNaN(h.target);
+
+  // ------------ Horizon parsing ------------
+  // The horizon stays free text, but where it can be read as a date we can
+  // annualise the gap between current and potential. Understood forms:
+  //   FY28 / FY2028      -> 31 Mar 2028 (Indian fiscal year end)
+  //   Mar 2030 / Dec-29  -> last day of that month
+  //   2028               -> 31 Dec 2028
+  //   3 years / 18 months-> that far from today
+  // First match wins, so "end of FY28 / early FY29" resolves to FY28.
+  const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec"];
+
+  const fullYear = (y) => (y < 100 ? 2000 + y : y);
+  const endOfMonth = (y, m) => new Date(y, m + 1, 0, 23, 59, 59);
+
+  function parseHorizon(text) {
+    if (!text) return null;
+    const s = String(text).trim().toLowerCase();
+
+    // Indian fiscal year: FY28 ends 31 March 2028
+    let m = s.match(/\bfy\s*'?\s*(\d{2}|\d{4})\b/);
+    if (m) return endOfMonth(fullYear(+m[1]), 2);
+
+    // Month name with a year: "mar 2030", "dec-29", "march 2030"
+    m = s.match(new RegExp(`\\b(${MONTHS.join("|")})[a-z]*\\.?[\\s\\-/,]*'?(\\d{2}|\\d{4})\\b`));
+    if (m) return endOfMonth(fullYear(+m[2]), MONTHS.indexOf(m[1]));
+
+    // Bare calendar year
+    m = s.match(/\b(20\d{2})\b/);
+    if (m) return endOfMonth(+m[1], 11);
+
+    // Relative durations
+    m = s.match(/\b(\d+(?:\.\d+)?)\s*(years?|yrs?|y)\b/);
+    if (m) {
+      const d = new Date();
+      d.setDate(d.getDate() + Math.round(parseFloat(m[1]) * 365.25));
+      return d;
+    }
+    m = s.match(/\b(\d+)\s*(months?|mos?|mths?)\b/);
+    if (m) {
+      const d = new Date();
+      d.setMonth(d.getMonth() + +m[1]);
+      return d;
+    }
+    return null;
+  }
+
+  const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
+
+  // Annualised rate from current to potential over the horizon. With a single
+  // start and end value and no cash flows between, IRR reduces to CAGR.
+  // Undefined if either end is non-positive — you can't annualise a move
+  // through zero — or if the date is too close to be meaningful.
+  function annualisedRate(current, potential, when) {
+    if (!when) return { ok: false, why: "unparsed" };
+    const years = (when.getTime() - Date.now()) / MS_PER_YEAR;
+    if (years <= 0) return { ok: false, why: "past", when };
+    if (years < 0.08) return { ok: false, why: "tooClose", when, years };
+    if (!(current > 0) || !(potential > 0)) return { ok: false, why: "nonPositive", when, years };
+    return { ok: true, when, years, rate: (Math.pow(potential / current, 1 / years) - 1) * 100 };
+  }
+
+  const fmtDate = (d) =>
+    `${d.getDate()} ${MONTHS[d.getMonth()].replace(/^./, (c) => c.toUpperCase())} ${d.getFullYear()}`;
 
   // Currency for a symbol. Normally from the price cache; the fallback only
   // matters when a target is set on a holding whose price fetch failed.
@@ -1182,6 +1270,31 @@
       dEl.className = "proj-delta " + (deltaINR > 0.5 ? "up" : deltaINR < -0.5 ? "down" : "flat");
       const sign = deltaINR >= 0 ? "+" : "−";
       dEl.textContent = `${sign}${fmtCr(Math.abs(deltaINR))} (${sign}${Math.abs(deltaPct).toFixed(1)}%)`;
+      const hz = $("projHorizon");
+      hz.textContent = state.horizon || "when?";
+      hz.classList.toggle("unset", !state.horizon);
+
+      // Annualised rate implied by the horizon, where one can be read from it.
+      const irrEl = $("projIrr");
+      const r = annualisedRate(totalINR, projTotalINR, parseHorizon(state.horizon));
+      if (r.ok) {
+        const cls = r.rate >= 0 ? "gain-up" : "gain-down";
+        irrEl.innerHTML =
+          `<span class="irr-rate ${cls}">${r.rate >= 0 ? "+" : ""}${r.rate.toFixed(1)}% a year</span>` +
+          `<span class="irr-basis">needed by ${escapeHtml(fmtDate(r.when))}` +
+          ` · ${r.years.toFixed(1)} yrs · assumes no further investment</span>`;
+      } else if (!state.horizon) {
+        irrEl.innerHTML = "";
+      } else if (r.why === "unparsed") {
+        irrEl.innerHTML = `<span class="irr-basis">Add a year — "FY28", "Mar 2030", "3 years" — for an annualised rate.</span>`;
+      } else if (r.why === "past") {
+        irrEl.innerHTML = `<span class="irr-basis">${escapeHtml(fmtDate(r.when))} has already passed.</span>`;
+      } else if (r.why === "tooClose") {
+        irrEl.innerHTML = `<span class="irr-basis">Too near to annualise meaningfully.</span>`;
+      } else {
+        irrEl.innerHTML = `<span class="irr-basis">Can't annualise across a zero or negative net worth.</span>`;
+      }
+
       const n = ["stocks", "funds", "metals", "cash", "debt"]
         .reduce((a, k) => a + (state[k] || []).filter(hasTarget).length, 0);
       $("projNote").textContent =
@@ -1638,6 +1751,22 @@
     });
   });
 
+  // Free-text horizon for the potential figure — "FY28", "Mar 2030", whatever
+  // is meaningful to you. Purely a note to self; nothing computes from it.
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-horizon]");
+    if (!cell || cell.querySelector("input")) return;
+    startInlineEdit(cell, {
+      initial: state.horizon || "",
+      numeric: false,
+      onCommit: (next) => {
+        if (next === (state.horizon || "")) return false;
+        state.horizon = next;
+        return true;
+      }
+    });
+  });
+
   $("clearTargetsBtn").addEventListener("click", () => {
     let changed = false;
     ["stocks", "funds", "metals", "cash", "debt"].forEach((k) => {
@@ -1773,6 +1902,7 @@
         state.cash = remote.cash || [];
         state.fundsPurchase = remote.fundsPurchase || 0;
         state.taxRate = remote.taxRate != null ? remote.taxRate : 15;
+        state.horizon = remote.horizon || "";
         state.updatedAt = remoteAt;
         saveLocal();
         applyingRemote = false;
@@ -1806,6 +1936,7 @@
         stocks: state.stocks, funds: state.funds, metals: state.metals,
         debt: state.debt, cash: state.cash,
         fundsPurchase: state.fundsPurchase, taxRate: state.taxRate,
+        horizon: state.horizon || "",
         updatedAt: state.updatedAt
       };
       await gistPatch(JSON.stringify(payload, null, 2));
