@@ -61,6 +61,35 @@
     padding: 6px 10px; font-size: 14px; line-height: 1;
   }
 
+  /* Row actions: drag handle + remove */
+  .row-actions { display: inline-flex; align-items: center; gap: 4px; justify-content: flex-end; }
+  .drag-handle {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    padding: 6px 8px; border-radius: 6px; font-size: 15px; line-height: 1;
+    cursor: grab; touch-action: none; user-select: none;
+  }
+  .drag-handle:hover { color: var(--accent); border-color: var(--border); background: var(--panel); }
+  .drag-handle:focus-visible { outline: none; color: var(--accent); border-color: var(--accent); }
+  .drag-handle:disabled { opacity: .2; cursor: default; }
+  .drag-handle:disabled:hover { color: var(--muted); border-color: transparent; background: transparent; }
+
+  tr.dragging {
+    opacity: .5;
+    background: rgba(110,168,254,.10) !important;
+    outline: 1px dashed var(--accent);
+  }
+  tr.drop-hint td { box-shadow: inset 0 2px 0 0 var(--accent); }
+  body.dragging-active { user-select: none; cursor: grabbing; }
+  body.dragging-active .drag-handle { cursor: grabbing; }
+
+  /* Inline label editing (cash & debt) */
+  .label-edit {
+    background: var(--bg-2); border: 1px solid var(--accent); color: var(--text);
+    padding: 5px 8px; border-radius: 6px; font-size: 14px; font-weight: 600;
+    width: 100%; max-width: 280px; letter-spacing: .3px;
+  }
+  .label-edit:focus { outline: none; }
+
   .hero {
     background: linear-gradient(135deg, var(--panel), var(--panel-2));
     border: 1px solid var(--border);
@@ -74,6 +103,37 @@
     width: 280px; height: 280px;
     background: radial-gradient(closest-side, rgba(110,168,254,.25), transparent);
   }
+  /* Hero splits into current (left) and potential (right) when targets are set */
+  .hero-split { display: flex; gap: 28px; align-items: flex-start; position: relative; z-index: 1; }
+  .hero-current { flex: 1 1 auto; min-width: 0; }
+  .hero-projection {
+    flex: 0 0 auto; min-width: 220px; max-width: 340px;
+    border-left: 1px solid var(--border); padding-left: 24px;
+  }
+  .proj-value {
+    font-size: 34px; font-weight: 700; margin: 10px 0 2px;
+    letter-spacing: -.5px; font-variant-numeric: tabular-nums; color: var(--text);
+  }
+  .proj-usd { font-size: 16px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .proj-delta {
+    display: inline-block; margin-top: 10px; padding: 3px 9px;
+    border-radius: 6px; font-size: 13px; font-weight: 600;
+  }
+  .proj-note { display: block; color: var(--muted); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
+  .proj-clear {
+    margin-top: 12px; padding: 5px 10px; font-size: 12px;
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+  }
+  .proj-clear:hover { color: var(--red); border-color: var(--red); background: transparent; }
+
+  /* Target cells */
+  .target-cell { cursor: pointer; }
+  .target-cell:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .target-unset { color: var(--muted); font-style: italic; opacity: .7; }
+  .target-set { color: var(--accent); font-weight: 600; }
+  .target-delta { display: block; font-size: 11px; margin-top: 2px; font-weight: 500; }
+  .section-proj { color: var(--accent); font-size: 13px; font-weight: 600; margin-left: 8px; }
+
   .hero-label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; }
   .hero-value {
     font-size: 56px; font-weight: 700; margin: 10px 0 2px;
@@ -189,6 +249,10 @@
   }
   .panel h2 .total { color: var(--text); font-size: 16px; }
 
+  /* Tables carry a lot of columns; let them scroll inside their panel on
+     narrow screens rather than pushing the whole page sideways. */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-scroll table { min-width: 100%; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   thead th {
     text-align: left; padding: 10px 8px; font-weight: 500;
@@ -281,6 +345,18 @@
     body { padding: 14px; }
     .hero-value { font-size: 40px; }
     thead th.hide-sm, tbody td.hide-sm { display: none; }
+    /* Potential stacks under current rather than beside it */
+    .hero-split { flex-direction: column; gap: 18px; }
+    .hero-projection {
+      border-left: none; border-top: 1px solid var(--border);
+      padding-left: 0; padding-top: 16px; max-width: none; width: 100%;
+    }
+    .proj-value { font-size: 28px; }
+    /* Tighten rows so the action cluster fits inside the panel */
+    tbody td, thead th { padding: 10px 4px; }
+    .row-actions { gap: 2px; }
+    button.icon { padding: 5px 7px; font-size: 12px; }
+    .drag-handle { padding: 6px 5px; font-size: 14px; }
   }
 </style>
 </head>
@@ -326,14 +402,29 @@
   </div>
 
   <section class="hero">
-    <div class="hero-label">Total Net Worth</div>
-    <div class="hero-value" id="totalValueInr">₹0.00 Cr</div>
-    <div class="hero-value-2" id="totalValueUsd">$0.00 Mn</div>
-    <div class="hero-sub">
-      <span id="lastUpdated">Never updated</span>
-      <span id="totalDay" class="hero-day flat">—</span>
-      <span id="fxPill" class="fx-pill">USD/INR —</span>
+    <div class="hero-split">
+      <div class="hero-current">
+        <div class="hero-label">Total Net Worth</div>
+        <div class="hero-value" id="totalValueInr">₹0.00 Cr</div>
+        <div class="hero-value-2" id="totalValueUsd">$0.00 Mn</div>
+        <div class="hero-sub">
+          <span id="lastUpdated">Never updated</span>
+          <span id="totalDay" class="hero-day flat">—</span>
+          <span id="fxPill" class="fx-pill">USD/INR —</span>
+        </div>
+      </div>
+
+      <!-- Only rendered once at least one target is set. -->
+      <div class="hero-projection" id="heroProjection" style="display:none">
+        <div class="hero-label">Potential</div>
+        <div class="proj-value" id="projValueInr">—</div>
+        <div class="proj-usd" id="projValueUsd">—</div>
+        <div><span class="proj-delta flat" id="projDelta">—</span></div>
+        <span class="proj-note" id="projNote"></span>
+        <button class="proj-clear" id="clearTargetsBtn">Clear all targets</button>
+      </div>
     </div>
+
     <div class="breakdown" id="breakdown"></div>
     <div class="legend">
       <span class="l-stocks">Stocks <span id="legend-stocks">—</span></span>
@@ -697,6 +788,70 @@
     };
   }
 
+  // ------------ Projection ("what if") ------------
+  // Each holding may carry a `target`: a target price for stocks, NAV for
+  // funds, price-per-troy-oz for metals, or a flat amount for cash/debt rows.
+  // Holdings without a target are projected at their current value, so a
+  // scenario reads as "these move, everything else holds".
+
+  const hasTarget = (h) => h && h.target != null && !isNaN(h.target);
+
+  // Currency for a symbol. Normally from the price cache; the fallback only
+  // matters when a target is set on a holding whose price fetch failed.
+  function currencyFor(sym) {
+    const p = prices[sym];
+    if (p && p.currency) return p.currency;
+    // Indian listings and AMFI mutual funds are INR; everything else (US
+    // tickers, the GC=F/SI=F metal futures) quotes in USD.
+    if (/^MF:/i.test(sym) || /\.(NS|BO)$/i.test(sym)) return "INR";
+    return "USD";
+  }
+
+  // Value of a holding at its target price, in INR. Falls back to the current
+  // value when no target is set; null when neither is knowable.
+  function projectedHolding(h) {
+    const ccy = currencyFor(h.symbol);
+    if (hasTarget(h)) {
+      const valueNative = Number(h.target) * h.qty;
+      let gainINR = null;
+      if (h.purchasePrice != null && h.purchasePrice > 0) {
+        gainINR = toINR((Number(h.target) - h.purchasePrice) * h.qty, ccy);
+      }
+      return { valueINR: toINR(valueNative, ccy), gainINR, currency: ccy };
+    }
+    const v = holdingValue(h);
+    return { valueINR: v.valueINR, gainINR: v.gainINR, currency: ccy };
+  }
+
+  const projectedAmount = (c) =>
+    toINR(Number(hasTarget(c) ? c.target : c.amount) || 0, c.currency || "INR");
+
+  function anyTargets() {
+    return ["stocks", "funds", "metals", "cash", "debt"]
+      .some((k) => (state[k] || []).some(hasTarget));
+  }
+
+  // Which state array a row `kind` refers to.
+  function listFor(kind) {
+    return kind === "stock" ? state.stocks
+         : kind === "fund"  ? state.funds
+         : kind === "metal" ? state.metals
+         : kind === "cash"  ? state.cash
+         : kind === "debt"  ? state.debt
+         : null;
+  }
+
+  // Drag handle + remove cluster shared by every section's rows.
+  // Single-row sections have nothing to reorder, so the handle is inert there.
+  function rowActions(kind, i, n) {
+    const lone = n < 2 ? " disabled" : "";
+    return `<div class="row-actions">` +
+      `<button class="drag-handle" data-drag="${kind}:${i}"${lone}` +
+        ` title="Drag to reorder (or focus and use ↑ / ↓)" aria-label="Reorder row">&#10303;</button>` +
+      `<button class="icon danger" data-del="${kind}:${i}" title="Remove" aria-label="Remove">&#10005;</button>` +
+      `</div>`;
+  }
+
   function renderTable(list, kind, sectionINR, grandINR) {
     if (!list.length) {
       return `<div class="empty">No ${kind} added yet. Add one below.</div>`;
@@ -723,6 +878,20 @@
         `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
         (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "") +
         pctLine;
+
+      // Target price cell — click to set a "what if" price for this holding.
+      const tCcy = ready ? v.currency : currencyFor(h.symbol);
+      let targetCell;
+      if (hasTarget(h)) {
+        const base = ready ? v.price : null;
+        const deltaPct = base ? ((Number(h.target) - base) / base) * 100 : null;
+        const dCls = deltaPct == null ? "" : deltaPct >= 0 ? "gain-up" : "gain-down";
+        targetCell = `<span class="target-set">${fmtNative(Number(h.target), tCcy)}</span>` +
+          (deltaPct == null ? "" :
+            `<span class="target-delta ${dCls}">${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%</span>`);
+      } else {
+        targetCell = `<span class="target-unset">set</span>`;
+      }
 
       const dayPct = ready && v.prev ? ((v.price - v.prev) / v.prev) * 100 : 0;
       const dayCls = dayPct > 0.0001 ? "up" : dayPct < -0.0001 ? "down" : "flat";
@@ -763,8 +932,9 @@
           <td class="num hide-sm">${priceCell}</td>
           ${buyCell}
           <td class="num hide-sm">${dayCell}</td>
+          <td class="num target-cell" data-edit-target="${kind}:${i}" title="Click to set a target ${kind === "fund" ? "NAV" : "price"}">${targetCell}</td>
           <td class="num">${valCell}</td>
-          <td class="num"><button class="icon danger" data-del="${kind}:${i}" title="Remove">✕</button></td>
+          <td class="num">${rowActions(kind, i, list.length)}</td>
         </tr>`;
     }).join("");
     const headLabel = kind === "fund" ? "Fund" : "Symbol";
@@ -772,6 +942,7 @@
     const priceLabel = kind === "fund" ? "NAV" : "Price";
     const buyHead = isStock ? `<th class="num hide-sm">Buy</th>` : "";
     return `
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -780,12 +951,14 @@
             <th class="num hide-sm">${priceLabel}</th>
             ${buyHead}
             <th class="num hide-sm">Day</th>
+            <th class="num">Target</th>
             <th class="num">Value</th>
             <th></th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table>
+      </div>`;
   }
 
   // Used for both cash and debt — same shape (label, amount, currency).
@@ -803,20 +976,37 @@
       const sectShare = sectionINR > 0 ? (inr / sectionINR * 100) : 0;
       const totalShare = grandINR > 0 ? (inr / grandINR * 100) : 0;
       const pctLine = `<span class="pct-line">${sectShare.toFixed(1)}% of ${sectLabel} · ${totalShare.toFixed(1)}% of total</span>`;
+
+      // Target amount — e.g. an FD's maturity value, or a loan paid down.
+      let targetCell;
+      if (hasTarget(c)) {
+        const base = Number(c.amount) || 0;
+        const deltaPct = base !== 0 ? ((Number(c.target) - base) / Math.abs(base)) * 100 : null;
+        const dCls = deltaPct == null ? "" : deltaPct >= 0 ? "gain-up" : "gain-down";
+        targetCell = `<span class="target-set">${fmtNative(Number(c.target), ccy)}</span>` +
+          (deltaPct == null ? "" :
+            `<span class="target-delta ${dCls}">${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%</span>`);
+      } else {
+        targetCell = `<span class="target-unset">set</span>`;
+      }
+
       return `
       <tr>
-        <td><div class="sym">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
+        <td><div class="sym editable" data-edit-label="${kindKey}:${i}" title="Click to edit label">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
         <td class="num editable" data-edit-amt="${kindKey}:${i}" title="Click to edit amount"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}</td>
-        <td class="num"><button class="icon danger" data-del="${kindKey}:${i}" title="Remove">✕</button></td>
+        <td class="num target-cell" data-edit-target="${kindKey}:${i}" title="Click to set a target amount">${targetCell}</td>
+        <td class="num">${rowActions(kindKey, i, entries.length)}</td>
       </tr>`;
     }).join("");
     return `
+      <div class="table-scroll">
       <table>
         <thead>
-          <tr><th>Label</th><th class="num">Amount</th><th></th></tr>
+          <tr><th>Label</th><th class="num">Amount</th><th class="num">Target</th><th></th></tr>
         </thead>
         <tbody>${rows}</tbody>
-      </table>`;
+      </table>
+      </div>`;
   }
 
   function escapeHtml(s) {
@@ -825,7 +1015,12 @@
     }[c]));
   }
 
+  // True while an inline label input is open or a row is being dragged, so the
+  // 2-minute price refresh can't re-render the table out from under the user.
+  let suppressRender = false;
+
   function render() {
+    if (suppressRender) return;
     // ---- 1. Sum everything in INR up-front (so per-row %s can use it) ----
     let stocksINR = 0, metalsINR = 0, fundsINR = 0, debtINR = 0, cashINR = 0;
     let stocksDayINR = 0, metalsDayINR = 0, fundsDayINR = 0;
@@ -870,6 +1065,37 @@
     const dayDeltaINR = stocksDayINR + fundsDayINR + metalsDayINR;
     const totalPrevINR = grossTotalINR - dayDeltaINR;   // gross prev for % calc; tax shifts both sides
 
+    // ---- 3b. Projected ("potential") net worth at target prices ----
+    // Same arithmetic as above, but every holding is valued at its target
+    // where one is set. Tax is recomputed on the projected gains, so the
+    // potential figure is after-tax and comparable to the headline.
+    let projStocksINR = 0, projFundsINR = 0, projMetalsINR = 0, projDebtINR = 0, projCashINR = 0;
+    let projStocksGainINR = 0;
+
+    state.stocks.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) {
+        projStocksINR += p.valueINR;
+        if (p.gainINR != null) projStocksGainINR += p.gainINR;
+      }
+    });
+    state.funds.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) projFundsINR += p.valueINR;
+    });
+    state.metals.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) projMetalsINR += p.valueINR;
+    });
+    state.debt.forEach((c) => { projDebtINR += projectedAmount(c); });
+    state.cash.forEach((c) => { projCashINR += projectedAmount(c); });
+
+    const projGrossINR = projStocksINR + projFundsINR + projDebtINR + projMetalsINR + projCashINR;
+    const projFundsGainINR = state.fundsPurchase > 0 ? (projFundsINR - Number(state.fundsPurchase)) : 0;
+    const projTotalGainINR = projStocksGainINR + projFundsGainINR;
+    const projLtcgTaxINR = projTotalGainINR > 0 ? (projTotalGainINR * taxRate / 100) : 0;
+    const projTotalINR = projGrossINR - projLtcgTaxINR;
+
     // ---- 4. Render tables now that we have section + grand totals ----
     $("stocksTable").innerHTML = renderTable(state.stocks, "stock", stocksINR, grossTotalINR);
     $("fundsTable").innerHTML = renderTable(state.funds, "fund", fundsINR, grossTotalINR);
@@ -878,11 +1104,44 @@
     $("cashTable").innerHTML = renderManualTable(state.cash, "cash", cashINR, grossTotalINR);
 
     // ---- 5. Header / legend / totals ----
-    $("stocksTotal").textContent = fmtBoth(stocksINR);
-    $("fundsTotal").textContent = fmtBoth(fundsINR);
-    $("debtTotal").textContent = fmtBoth(debtINR);
-    $("metalsTotal").textContent = fmtBoth(metalsINR);
-    $("cashTotal").textContent = fmtBoth(cashINR);
+    // Section totals; sections carrying targets also show where they'd land.
+    const setSectionTotal = (id, cur, proj, list) => {
+      const el = $(id);
+      el.textContent = fmtBoth(cur);
+      if ((list || []).some(hasTarget)) {
+        const s = document.createElement("span");
+        s.className = "section-proj";
+        s.textContent = "→ " + fmtCr(proj);
+        el.appendChild(document.createTextNode(" "));
+        el.appendChild(s);
+      }
+    };
+    setSectionTotal("stocksTotal", stocksINR, projStocksINR, state.stocks);
+    setSectionTotal("fundsTotal", fundsINR, projFundsINR, state.funds);
+    setSectionTotal("debtTotal", debtINR, projDebtINR, state.debt);
+    setSectionTotal("metalsTotal", metalsINR, projMetalsINR, state.metals);
+    setSectionTotal("cashTotal", cashINR, projCashINR, state.cash);
+
+    // Potential panel — only present once at least one target exists, and
+    // always alongside the current headline, never replacing it.
+    const showProj = anyTargets();
+    $("heroProjection").style.display = showProj ? "" : "none";
+    if (showProj) {
+      $("projValueInr").textContent = fmtCr(projTotalINR);
+      $("projValueUsd").textContent = fmtMn(projTotalINR / usdInr);
+      const deltaINR = projTotalINR - totalINR;
+      const deltaPct = totalINR !== 0 ? (deltaINR / Math.abs(totalINR)) * 100 : 0;
+      const dEl = $("projDelta");
+      dEl.className = "proj-delta " + (deltaINR > 0.5 ? "up" : deltaINR < -0.5 ? "down" : "flat");
+      const sign = deltaINR >= 0 ? "+" : "−";
+      dEl.textContent = `${sign}${fmtCr(Math.abs(deltaINR))} (${sign}${Math.abs(deltaPct).toFixed(1)}%)`;
+      const n = ["stocks", "funds", "metals", "cash", "debt"]
+        .reduce((a, k) => a + (state[k] || []).filter(hasTarget).length, 0);
+      $("projNote").textContent =
+        `${n} target${n === 1 ? "" : "s"} set · everything else held at today's value` +
+        (projLtcgTaxINR > 0 ? ` · net of est. LTCG ${fmtCr(projLtcgTaxINR)}` : "");
+    }
+
     $("totalValueInr").textContent = fmtCr(totalINR);
     $("totalValueUsd").textContent = fmtMn(totalUSD);
     $("fxPill").textContent = "USD/INR " + usdInr.toFixed(2);
@@ -1162,6 +1421,184 @@
     state.debt.push({ label, amount: amt, currency });
     save();
     $("debtLabel").value = ""; $("debtAmt").value = "";
+    render();
+  });
+
+  // ------------ Drag to reorder rows (all sections) ------------
+  // Pointer Events so one code path covers mouse, trackpad, touch and pen.
+  // The dragged <tr> is moved among its siblings live, so what you see during
+  // the drag is exactly where it lands; state is rewritten once, on drop.
+  let drag = null;
+
+  function moveInList(kind, from, to) {
+    const list = listFor(kind);
+    if (!list || from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return false;
+    const [item] = list.splice(from, 1);
+    list.splice(to, 0, item);
+    return true;
+  }
+
+  document.body.addEventListener("pointerdown", (e) => {
+    const handle = e.target.closest("[data-drag]");
+    if (!handle || handle.disabled || e.button > 0) return;
+    const row = handle.closest("tr");
+    const tbody = row && row.parentNode;
+    if (!tbody || tbody.children.length < 2) return;
+
+    e.preventDefault();
+    handle.focus();
+    const [kind] = handle.dataset.drag.split(":");
+    drag = { kind, row, tbody, from: Array.prototype.indexOf.call(tbody.children, row) };
+    try { handle.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
+    row.classList.add("dragging");
+    document.body.classList.add("dragging-active");
+    suppressRender = true;
+  });
+
+  document.body.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const { row, tbody } = drag;
+    const y = e.clientY;
+    let target = null;
+    for (const sib of tbody.children) {
+      if (sib === row) continue;
+      const r = sib.getBoundingClientRect();
+      if (y < r.top + r.height / 2) { target = sib; break; }
+    }
+    if (target) {
+      if (target !== row.nextSibling) tbody.insertBefore(row, target);
+    } else if (row !== tbody.lastElementChild) {
+      tbody.appendChild(row);
+    }
+  });
+
+  function endDrag() {
+    if (!drag) return;
+    const { kind, row, tbody, from } = drag;
+    const to = Array.prototype.indexOf.call(tbody.children, row);
+    row.classList.remove("dragging");
+    document.body.classList.remove("dragging-active");
+    drag = null;
+    suppressRender = false;
+    if (to !== -1 && to !== from && moveInList(kind, from, to)) save();
+    render();
+  }
+  document.body.addEventListener("pointerup", endDrag);
+  document.body.addEventListener("pointercancel", endDrag);
+
+  // Keyboard equivalent — tab to a handle, then ↑ / ↓ to move the row.
+  document.body.addEventListener("keydown", (e) => {
+    const handle = e.target.closest && e.target.closest("[data-drag]");
+    if (!handle || handle.disabled) return;
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    const [kind, idxRaw] = handle.dataset.drag.split(":");
+    const from = +idxRaw;
+    const to = from + (e.key === "ArrowUp" ? -1 : 1);
+    if (!moveInList(kind, from, to)) return;
+    save();
+    render();
+    // Keep focus on the same row after the table is rebuilt.
+    const next = document.querySelector(`[data-drag="${kind}:${to}"]`);
+    if (next) next.focus();
+  });
+
+  // ------------ Inline cell editing ------------
+  // Shared by label editing (cash & debt) and target entry (every section).
+  // `onCommit` receives the trimmed string and returns true if it changed
+  // state, so we only save when something actually moved.
+  function startInlineEdit(cell, { initial, numeric, onCommit }) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "label-edit";
+    input.value = initial;
+    input.maxLength = 80;
+    input.spellcheck = false;
+    if (numeric) {
+      input.inputMode = "decimal";
+      input.style.textAlign = "right";
+    }
+    cell.textContent = "";
+    cell.appendChild(input);
+    suppressRender = true;
+    input.focus();
+    input.select();
+
+    let settled = false;
+    const finish = (commit) => {
+      if (settled) return;
+      settled = true;
+      suppressRender = false;
+      if (commit && onCommit(input.value.trim())) save();
+      render();
+    };
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+      else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+      ev.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("click", (ev) => ev.stopPropagation());
+  }
+
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-label]");
+    if (!cell || cell.querySelector("input")) return;
+    const [kind, idx] = cell.dataset.editLabel.split(":");
+    const list = listFor(kind);
+    const entry = list && list[+idx];
+    if (!entry) return;
+    startInlineEdit(cell, {
+      initial: entry.label,
+      numeric: false,
+      onCommit: (next) => {
+        if (!next || next === entry.label) return false;
+        entry.label = next;
+        return true;
+      }
+    });
+  });
+
+  // Target price / NAV / amount. Blank clears the target for that row.
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-target]");
+    if (!cell || cell.querySelector("input")) return;
+    const [kind, idx] = cell.dataset.editTarget.split(":");
+    const list = listFor(kind);
+    const entry = list && list[+idx];
+    if (!entry) return;
+    startInlineEdit(cell, {
+      initial: hasTarget(entry) ? String(entry.target) : "",
+      numeric: true,
+      onCommit: (next) => {
+        if (next === "") {
+          if (!hasTarget(entry)) return false;
+          delete entry.target;
+          return true;
+        }
+        const v = parseFloat(next);
+        if (isNaN(v)) { toast("Target must be a number", true); return false; }
+        // Prices can't be negative; cash and debt amounts can (a loan).
+        if (v < 0 && kind !== "cash" && kind !== "debt") {
+          toast("Target price can't be negative", true);
+          return false;
+        }
+        if (entry.target === v) return false;
+        entry.target = v;
+        return true;
+      }
+    });
+  });
+
+  $("clearTargetsBtn").addEventListener("click", () => {
+    let changed = false;
+    ["stocks", "funds", "metals", "cash", "debt"].forEach((k) => {
+      (state[k] || []).forEach((entry) => {
+        if (hasTarget(entry)) { delete entry.target; changed = true; }
+      });
+    });
+    if (changed) { save(); toast("Targets cleared"); }
     render();
   });
 
