@@ -132,6 +132,15 @@
   .target-unset { color: var(--muted); font-style: italic; opacity: .7; }
   .target-set { color: var(--accent); font-weight: 600; }
   .target-delta { display: block; font-size: 11px; margin-top: 2px; font-weight: 500; }
+  /* "At target" line under a row's current value */
+  .proj-line {
+    margin-top: 7px; padding-top: 6px;
+    border-top: 1px dashed rgba(110,168,254,.28);
+    color: var(--accent); font-size: 13px;
+  }
+  .proj-line .proj-arrow { opacity: .65; margin-right: 2px; }
+  .proj-line .proj-inr { color: var(--accent); opacity: .75; font-size: 12px; }
+  .proj-line .pct-line { color: var(--accent); opacity: .7; }
   .section-proj { color: var(--accent); font-size: 13px; font-weight: 600; margin-left: 8px; }
 
   .hero-label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; }
@@ -841,6 +850,32 @@
          : null;
   }
 
+  // A row's share of its section and of the whole. A section holding both
+  // assets and liabilities (an FD next to a home loan) can net to zero or a
+  // negative, and a share of a negative base is meaningless — "-185.7% of
+  // debt" tells you nothing — so the section share is dropped in that case
+  // and only the portfolio share is shown.
+  function shareText(valueINR, sectionINR, grandINR, sectLabel, totalWord) {
+    const totalShare = grandINR ? (valueINR / grandINR * 100) : 0;
+    const parts = [];
+    if (sectionINR > 0) parts.push(`${(valueINR / sectionINR * 100).toFixed(1)}% of ${sectLabel}`);
+    parts.push(`${totalShare.toFixed(1)}% of ${totalWord}`);
+    return parts.join(" · ");
+  }
+
+  // The "at target" line under a row's value: what the holding would be worth
+  // and the share of the portfolio it would then represent. Shares are taken
+  // against the projected totals, so a row's target share reflects every other
+  // target too, not just its own.
+  function projectedValueLine(valueNative, valueINR, ccy, projSectionINR, projGrandINR, sectLabel) {
+    if (valueINR == null) return "";
+    return `<div class="proj-line">` +
+      `<span class="proj-arrow">&#8594;</span> <strong>${fmtNative(valueNative, ccy)}</strong>` +
+      (ccy !== "INR" ? ` <span class="proj-inr">${fmtCr(valueINR)}</span>` : "") +
+      `<span class="pct-line">${shareText(valueINR, projSectionINR, projGrandINR, sectLabel, "potential")}</span>` +
+      `</div>`;
+  }
+
   // Drag handle + remove cluster shared by every section's rows.
   // Single-row sections have nothing to reorder, so the handle is inert there.
   function rowActions(kind, i, n) {
@@ -852,7 +887,7 @@
       `</div>`;
   }
 
-  function renderTable(list, kind, sectionINR, grandINR) {
+  function renderTable(list, kind, sectionINR, grandINR, projSectionINR, projGrandINR) {
     if (!list.length) {
       return `<div class="empty">No ${kind} added yet. Add one below.</div>`;
     }
@@ -866,21 +901,30 @@
         ? (prices[h.symbol]?.error ? `<span style="color:var(--red)" title="${escapeHtml(prices[h.symbol].error)}">err</span>` : `<span class="meta">…</span>`)
         : fmtNative(v.price, v.currency) + staleTag;
 
+      const sectLabel = kind === "stock" ? "stocks" : kind === "fund" ? "funds" : "metals";
+
       // Per-row percentages
       let pctLine = "";
       if (ready) {
-        const sectShare = sectionINR > 0 ? (v.valueINR / sectionINR * 100) : 0;
-        const totalShare = grandINR > 0 ? (v.valueINR / grandINR * 100) : 0;
-        const sectLabel = kind === "stock" ? "stocks" : kind === "fund" ? "funds" : "metals";
-        pctLine = `<span class="pct-line">${sectShare.toFixed(1)}% of ${sectLabel} · ${totalShare.toFixed(1)}% of total</span>`;
+        pctLine = `<span class="pct-line">${shareText(v.valueINR, sectionINR, grandINR, sectLabel, "total")}</span>`;
       }
-      const valCell = !ready ? "—" :
-        `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
-        (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "") +
-        pctLine;
+
+      const tCcy = ready ? v.currency : currencyFor(h.symbol);
+
+      // What this row is worth at its target, and the share it would then
+      // occupy — measured against the projected totals, not today's.
+      const projLine = hasTarget(h)
+        ? projectedValueLine(Number(h.target) * h.qty, projectedHolding(h).valueINR,
+                             tCcy, projSectionINR, projGrandINR, sectLabel)
+        : "";
+
+      const valCell = (!ready
+        ? (projLine ? "" : "—")
+        : `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
+          (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "") +
+          pctLine) + projLine;
 
       // Target price cell — click to set a "what if" price for this holding.
-      const tCcy = ready ? v.currency : currencyFor(h.symbol);
       let targetCell;
       if (hasTarget(h)) {
         const base = ready ? v.price : null;
@@ -962,7 +1006,7 @@
   }
 
   // Used for both cash and debt — same shape (label, amount, currency).
-  function renderManualTable(entries, kindKey, sectionINR, grandINR) {
+  function renderManualTable(entries, kindKey, sectionINR, grandINR, projSectionINR, projGrandINR) {
     const sectLabel = kindKey;   // "cash" or "debt"
     const emptyMsg = kindKey === "debt"
       ? "No debt holdings yet. Add an FD, PPF, NPS, or bond below."
@@ -973,9 +1017,12 @@
     const rows = entries.map((c, i) => {
       const ccy = c.currency || "INR";
       const inr = toINR(c.amount, ccy);
-      const sectShare = sectionINR > 0 ? (inr / sectionINR * 100) : 0;
-      const totalShare = grandINR > 0 ? (inr / grandINR * 100) : 0;
-      const pctLine = `<span class="pct-line">${sectShare.toFixed(1)}% of ${sectLabel} · ${totalShare.toFixed(1)}% of total</span>`;
+      const pctLine = `<span class="pct-line">${shareText(inr, sectionINR, grandINR, sectLabel, "total")}</span>`;
+
+      const projLine = hasTarget(c)
+        ? projectedValueLine(Number(c.target), projectedAmount(c), ccy,
+                             projSectionINR, projGrandINR, sectLabel)
+        : "";
 
       // Target amount — e.g. an FD's maturity value, or a loan paid down.
       let targetCell;
@@ -993,7 +1040,7 @@
       return `
       <tr>
         <td><div class="sym editable" data-edit-label="${kindKey}:${i}" title="Click to edit label">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
-        <td class="num editable" data-edit-amt="${kindKey}:${i}" title="Click to edit amount"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}</td>
+        <td class="num editable" data-edit-amt="${kindKey}:${i}" title="Click to edit amount"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}${projLine}</td>
         <td class="num target-cell" data-edit-target="${kindKey}:${i}" title="Click to set a target amount">${targetCell}</td>
         <td class="num">${rowActions(kindKey, i, entries.length)}</td>
       </tr>`;
@@ -1097,11 +1144,11 @@
     const projTotalINR = projGrossINR - projLtcgTaxINR;
 
     // ---- 4. Render tables now that we have section + grand totals ----
-    $("stocksTable").innerHTML = renderTable(state.stocks, "stock", stocksINR, grossTotalINR);
-    $("fundsTable").innerHTML = renderTable(state.funds, "fund", fundsINR, grossTotalINR);
-    $("metalsTable").innerHTML = renderTable(state.metals, "metal", metalsINR, grossTotalINR);
-    $("debtTable").innerHTML = renderManualTable(state.debt, "debt", debtINR, grossTotalINR);
-    $("cashTable").innerHTML = renderManualTable(state.cash, "cash", cashINR, grossTotalINR);
+    $("stocksTable").innerHTML = renderTable(state.stocks, "stock", stocksINR, grossTotalINR, projStocksINR, projGrossINR);
+    $("fundsTable").innerHTML = renderTable(state.funds, "fund", fundsINR, grossTotalINR, projFundsINR, projGrossINR);
+    $("metalsTable").innerHTML = renderTable(state.metals, "metal", metalsINR, grossTotalINR, projMetalsINR, projGrossINR);
+    $("debtTable").innerHTML = renderManualTable(state.debt, "debt", debtINR, grossTotalINR, projDebtINR, projGrossINR);
+    $("cashTable").innerHTML = renderManualTable(state.cash, "cash", cashINR, grossTotalINR, projCashINR, projGrossINR);
 
     // ---- 5. Header / legend / totals ----
     // Section totals; sections carrying targets also show where they'd land.
