@@ -82,6 +82,23 @@
   body.dragging-active { user-select: none; cursor: grabbing; }
   body.dragging-active .drag-handle { cursor: grabbing; }
 
+  /* LTCG exemption */
+  button.icon.tax-toggle {
+    padding: 4px 7px; font-size: 11px; font-weight: 700; color: var(--muted);
+  }
+  button.icon.tax-toggle:hover { color: var(--accent); border-color: var(--accent); }
+  button.icon.tax-toggle.exempt {
+    color: var(--green); border-color: rgba(52, 211, 153, .5);
+    background: rgba(52, 211, 153, .10); text-decoration: line-through;
+  }
+  .exempt-tag {
+    display: inline-block; margin-left: 8px; padding: 1px 6px;
+    border-radius: 5px; font-size: 10px; font-weight: 600; letter-spacing: .3px;
+    text-transform: uppercase; vertical-align: middle;
+    color: var(--green); background: rgba(52, 211, 153, .12);
+    border: 1px solid rgba(52, 211, 153, .35);
+  }
+
   /* Inline label editing (cash & debt) */
   .label-edit {
     background: var(--bg-2); border: 1px solid var(--accent); color: var(--text);
@@ -966,9 +983,10 @@
 
   // Drag handle + remove cluster shared by every section's rows.
   // Single-row sections have nothing to reorder, so the handle is inert there.
-  function rowActions(kind, i, n) {
+  function rowActions(kind, i, n, extra) {
     const lone = n < 2 ? " disabled" : "";
     return `<div class="row-actions">` +
+      (extra || "") +
       `<button class="drag-handle" data-drag="${kind}:${i}"${lone}` +
         ` title="Drag to reorder (or focus and use ↑ / ↓)" aria-label="Reorder row">&#10303;</button>` +
       `<button class="icon danger" data-del="${kind}:${i}" title="Remove" aria-label="Remove">&#10005;</button>` +
@@ -1051,10 +1069,25 @@
         primary = h.symbol;
         secondary = ready && v.name && v.name !== h.symbol ? `<div class="meta">${escapeHtml(v.name)}</div>` : "";
       }
+      // Stocks can be marked exempt from the LTCG provision (a holding whose
+      // gain isn't taxable for you). Flagged on the row so it's never a
+      // silent assumption sitting behind the headline number.
+      const exemptTag = (isStock && h.noTax)
+        ? `<span class="exempt-tag" title="Gain excluded from the LTCG estimate">LTCG exempt</span>`
+        : "";
+
+      const taxBtn = isStock
+        ? `<button class="icon tax-toggle${h.noTax ? " exempt" : ""}" data-tax="${i}"` +
+          ` title="${h.noTax
+              ? "Exempt from LTCG — click to include this holding's gain again"
+              : "Taxed in the LTCG estimate — click to exempt this holding"}"` +
+          ` aria-pressed="${h.noTax ? "true" : "false"}" aria-label="Toggle LTCG exemption">%</button>`
+        : "";
+
       return `
         <tr>
           <td>
-            <div class="sym">${escapeHtml(primary)}</div>
+            <div class="sym">${escapeHtml(primary)}${exemptTag}</div>
             ${secondary}
           </td>
           <td class="num">
@@ -1066,7 +1099,7 @@
           <td class="num hide-sm">${dayCell}</td>
           <td class="num target-cell" data-edit-target="${kind}:${i}" title="Click to set a target ${kind === "fund" ? "NAV" : "price"}">${targetCell}</td>
           <td class="num">${valCell}</td>
-          <td class="num">${rowActions(kind, i, list.length)}</td>
+          <td class="num">${rowActions(kind, i, list.length, taxBtn)}</td>
         </tr>`;
     }).join("");
     const headLabel = kind === "fund" ? "Fund" : "Symbol";
@@ -1166,7 +1199,9 @@
       if (v.valueINR != null) {
         stocksINR += v.valueINR;
         stocksDayINR += v.dayChangeINR || 0;
-        if (v.gainINR != null) stocksGainINR += v.gainINR;   // signed; can be negative
+        // Holdings marked exempt still count toward net worth; only their
+        // gain stays out of the taxable base.
+        if (v.gainINR != null && !h.noTax) stocksGainINR += v.gainINR;   // signed; can be negative
       }
     });
     state.funds.forEach((h) => {
@@ -1211,7 +1246,7 @@
       const p = projectedHolding(h);
       if (p.valueINR != null) {
         projStocksINR += p.valueINR;
-        if (p.gainINR != null) projStocksGainINR += p.gainINR;
+        if (p.gainINR != null && !h.noTax) projStocksGainINR += p.gainINR;
       }
     });
     state.funds.forEach((h) => {
@@ -1327,9 +1362,15 @@
     if ($("taxRate") !== document.activeElement) {
       $("taxRate").value = taxRate;
     }
-    $("taxText").textContent = ltcgTaxINR > 0
+    // Say how many holdings are being left out, so an exemption can never
+    // quietly shrink the provision without it being visible.
+    const exemptCount = state.stocks.filter((h) => h.noTax).length;
+    const exemptNote = exemptCount
+      ? ` · ${exemptCount} holding${exemptCount === 1 ? "" : "s"} exempt`
+      : "";
+    $("taxText").textContent = (ltcgTaxINR > 0
       ? `Net of est. LTCG: −${fmtCr(ltcgTaxINR)}`
-      : "Net of est. LTCG: —";
+      : "Net of est. LTCG: —") + exemptNote;
 
     // Funds gain text next to total invested input
     if (state.fundsPurchase > 0) {
@@ -1749,6 +1790,22 @@
         return true;
       }
     });
+  });
+
+  // Exempt a holding's gain from the LTCG provision — for a stock where the
+  // gain isn't taxable for you. The holding's value still counts toward net
+  // worth; only its gain leaves the taxable base.
+  document.body.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-tax]");
+    if (!btn) return;
+    const h = state.stocks[+btn.dataset.tax];
+    if (!h) return;
+    if (h.noTax) delete h.noTax; else h.noTax = true;
+    save();
+    render();
+    toast(h.noTax
+      ? `${h.symbol} exempt from the LTCG estimate`
+      : `${h.symbol} back in the LTCG estimate`);
   });
 
   // Free-text horizon for the potential figure — "FY28", "Mar 2030", whatever
