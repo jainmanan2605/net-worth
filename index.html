@@ -400,6 +400,24 @@
     button.icon { padding: 5px 7px; font-size: 12px; }
     .drag-handle { padding: 6px 5px; font-size: 14px; }
   }
+  /* ---- History chart ---- */
+  #historyPanel h2 button { font-size: 12px; padding: 6px 10px; }
+  .hist-chart { position: relative; margin-top: 8px; }
+  .hist-chart svg { display: block; width: 100%; height: 220px; overflow: visible; }
+  .hist-chart .grid { stroke: var(--border); stroke-width: 1; }
+  .hist-chart .axis-label { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .hist-chart .line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  .hist-chart .area { fill: var(--accent); opacity: .08; }
+  .hist-chart .dot { fill: var(--accent); stroke: var(--panel); stroke-width: 2; }
+  .hist-chart .xhair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+  .hist-tip {
+    position: absolute; pointer-events: none; transform: translate(-50%, -100%);
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; font-size: 12px; white-space: nowrap; color: var(--text);
+  }
+  .hist-tip .d { color: var(--muted); display: block; font-size: 11px; }
+  .hist-empty { color: var(--muted); font-size: 13px; padding: 28px 0; text-align: center; }
+  .hist-note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
 </style>
 </head>
 <body>
@@ -564,6 +582,13 @@
     </div>
   </section>
 
+  <section class="panel" id="historyPanel">
+    <h2><span>History <span class="section-pct" id="historyMeta">—</span></span>
+      <button id="historyCsvBtn" disabled>Download CSV</button></h2>
+    <div id="historyChart" class="hist-chart"><div class="hist-empty">Connect Sync to see your daily net worth history.</div></div>
+    <p class="hist-note">Saved automatically at 11:30 PM IST each night. When you open this page before then, today's value is saved too, and the nightly figure replaces it.</p>
+  </section>
+
   <p class="footer-note">
     Prices &amp; USD/INR via Yahoo Finance (private proxy if configured, public proxy fallbacks) · Auto-refresh every 2 min · Cached locally so values persist if a fetch fails.
   </p>
@@ -617,6 +642,7 @@
 
   // USD/INR exchange rate (e.g. 83.5 => 1 USD = 83.5 INR). Defaults until first fetch.
   let usdInr = Number(localStorage.getItem("usdInrRate")) || 83;
+  let lastHeadline = null;   // { inr, usdInr, complete } from the latest render(); used by the daily history save
 
   // ------------ Helpers ------------
   const $ = (id) => document.getElementById(id);
@@ -845,6 +871,7 @@
     $("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
     render();
     refreshing = false;
+    if (!failed.length && fx && fx.price && !fx.stale) saveDailySnapshot();
   }
 
   // ------------ Render ------------
@@ -1262,6 +1289,9 @@
 
     // ---- 3. After-tax NW (the headline number) ----
     const totalINR = grossTotalINR - ltcgTaxINR;
+    const allPriced = [...state.stocks, ...state.funds, ...state.metals]
+      .every((h) => prices[h.symbol] && prices[h.symbol].price != null && !prices[h.symbol].stale);
+    lastHeadline = { inr: totalINR, usdInr, complete: allPriced };
     const totalUSD = totalINR / usdInr;
     const dayDeltaINR = stocksDayINR + fundsDayINR + metalsDayINR;
     const totalPrevINR = grossTotalINR - dayDeltaINR;   // gross prev for % calc; tax shifts both sides
@@ -1970,6 +2000,7 @@
     setSyncStatus("Checking…", "syncing");
     try {
       const gist = await gistGet();
+      loadHistoryFromGist(gist);
       const file = gist.files && gist.files["holdings.json"];
       if (!file || !file.content || file.content.trim() === "" || file.content.trim() === "{}") {
         // First-time: gist exists but empty; push our local state up to seed it.
@@ -2063,6 +2094,168 @@
       $("syncStatus").style.display = "none";
     }
   }
+
+  // ============================================================
+  // Daily net-worth history (history.csv in the sync gist)
+  // The Cloudflare Worker (worker.js) writes the nightly "auto" row at 23:30 IST.
+  // This page only writes a "site" row as a backup and never overwrites "auto".
+  // ============================================================
+  const HISTORY_FILE = "history.csv";
+  const CSV_HEADER = "Date,Net worth (INR),Net worth (Cr),USD/INR,Source,Saved at (IST)";
+  let history = null;            // [{ date, inr, source, time, line }] sorted by date; null = not loaded
+  let lastSiteSave = 0;
+
+  const istNow = () => {
+    const s = new Date(Date.now() + 5.5 * 3600e3).toISOString();
+    return { date: s.slice(0, 10), time: s.slice(11, 16) };
+  };
+
+  function parseHistory(csv) {
+    return (csv || "").split(/\r?\n/).slice(1)
+      .filter((l) => /^\d{4}-\d{2}-\d{2},/.test(l))
+      .map((l) => {
+        const c = l.split(",");
+        return { date: c[0], inr: Number(c[1]), source: c[4] || "", time: c[5] || "", line: l };
+      })
+      .filter((r) => isFinite(r.inr))
+      .sort((a, b) => a.date.localeCompare(b.date));
+  }
+  const historyCsv = (rows) => [CSV_HEADER, ...rows.map((r) => r.line)].join("\n") + "\n";
+
+  async function gistFileText(file) {
+    if (!file) return "";
+    if (!file.truncated) return file.content || "";
+    return (await fetch(file.raw_url, { cache: "no-store" })).text();
+  }
+
+  async function loadHistoryFromGist(gist) {
+    try {
+      history = parseHistory(await gistFileText(gist.files && gist.files[HISTORY_FILE]));
+      renderHistory();
+    } catch (e) { console.warn("history load failed:", e); }
+  }
+
+  // Backup save: only when today has no row, or today's row is our own "site"
+  // row and 30+ minutes old. Re-reads the gist first so it never clobbers the
+  // Worker's nightly row.
+  async function saveDailySnapshot() {
+    if (!sync || !history || !lastHeadline || !lastHeadline.complete) return;
+    if (Date.now() - lastSiteSave < 30 * 60e3) return;
+    const { date, time } = istNow();
+    const today = history.find((r) => r.date === date);
+    if (today && today.source !== "site") return;
+    lastSiteSave = Date.now();
+    try {
+      const gist = await gistGet();
+      const rows = parseHistory(await gistFileText(gist.files && gist.files[HISTORY_FILE]));
+      const current = rows.find((r) => r.date === date);
+      if (current && current.source !== "site") { history = rows; renderHistory(); return; }
+      const inr = lastHeadline.inr;
+      const line = [date, Math.round(inr), (inr / 1e7).toFixed(2), lastHeadline.usdInr.toFixed(2), "site", time].join(",");
+      const next = rows.filter((r) => r.date !== date);
+      next.push({ date, inr: Math.round(inr), source: "site", time, line });
+      next.sort((a, b) => a.date.localeCompare(b.date));
+      const r = await fetch(`https://api.github.com/gists/${encodeURIComponent(sync.gistId)}`, {
+        method: "PATCH",
+        headers: {
+          "Authorization": `token ${sync.token}`,
+          "Accept": "application/vnd.github+json",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ files: { [HISTORY_FILE]: { content: historyCsv(next) } } })
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      history = next;
+      renderHistory();
+    } catch (e) {
+      console.warn("daily snapshot failed:", e);
+      lastSiteSave = 0;
+    }
+  }
+
+  const fmtDay = (iso, withYear) => {
+    const d = new Date(iso + "T00:00:00");
+    return d.toLocaleDateString("en-IN", withYear ? { day: "numeric", month: "short", year: "numeric" } : { day: "numeric", month: "short" });
+  };
+
+  function renderHistory() {
+    const box = $("historyChart");
+    const btn = $("historyCsvBtn");
+    if (!history) return;
+    btn.disabled = !history.length;
+    $("historyMeta").textContent = history.length ? `${history.length} day${history.length > 1 ? "s" : ""}` : "—";
+    if (!history.length) {
+      box.innerHTML = '<div class="hist-empty">No history yet. The first entry is saved tonight at 11:30 PM IST.</div>';
+      return;
+    }
+
+    const W = Math.max(300, Math.round(box.clientWidth) || 800), H = 220, L = 64, R = 12, T = 12, B = 26;
+    const vals = history.map((r) => r.inr);
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    const pad = (hi - lo) * 0.1 || Math.max(hi * 0.01, 1e5);
+    lo -= pad; hi += pad;
+    const n = history.length;
+    const x = (i) => n === 1 ? L + (W - L - R) / 2 : L + (i / (n - 1)) * (W - L - R);
+    const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+
+    const ticks = [0, 1, 2, 3].map((k) => lo + (k / 3) * (hi - lo));
+    const grid = ticks.map((v) =>
+      `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
+      `<text class="axis-label" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${(v / 1e7).toFixed(2)} Cr</text>`).join("");
+    const xl = n === 1
+      ? `<text class="axis-label" x="${x(0)}" y="${H - 6}" text-anchor="middle">${fmtDay(history[0].date, true)}</text>`
+      : `<text class="axis-label" x="${L}" y="${H - 6}">${fmtDay(history[0].date, true)}</text>` +
+        `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">${fmtDay(history[n - 1].date, true)}</text>`;
+    const pts = history.map((r, i) => `${x(i).toFixed(1)},${y(r.inr).toFixed(1)}`);
+    const line = n > 1 ? `<path class="area" d="M${pts[0]} L${pts.join(" L")} L${x(n - 1)},${H - B} L${x(0)},${H - B} Z"/><polyline class="line" points="${pts.join(" ")}"/>` : "";
+
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Net worth by day">
+        ${grid}${xl}${line}
+        <line class="xhair" id="histX" x1="0" x2="0" y1="${T}" y2="${H - B}" style="display:none"/>
+        <circle class="dot" id="histDot" r="5" cx="${x(n - 1)}" cy="${y(history[n - 1].inr)}"/>
+        <rect id="histHit" x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/>
+      </svg><div class="hist-tip" id="histTip" style="display:none"></div>`;
+
+    const svg = box.querySelector("svg"), tip = $("histTip"), dot = $("histDot"), xh = $("histX");
+    const show = (i) => {
+      const r = history[i];
+      const px = x(i), py = y(r.inr);
+      dot.setAttribute("cx", px); dot.setAttribute("cy", py);
+      xh.setAttribute("x1", px); xh.setAttribute("x2", px); xh.style.display = "";
+      const sx = svg.clientWidth / W, sy = svg.clientHeight / H;
+      tip.style.left = Math.min(Math.max(px * sx, 70), svg.clientWidth - 70) + "px";
+      tip.style.top = (py * sy - 10) + "px";
+      tip.innerHTML = `<span class="d">${fmtDay(r.date, true)}${r.source === "site" ? " · saved " + r.time : ""}</span>${fmtCr(r.inr)}`;
+      tip.style.display = "";
+    };
+    const hit = $("histHit");
+    hit.addEventListener("pointermove", (e) => {
+      const b = svg.getBoundingClientRect();
+      const vx = (e.clientX - b.left) / b.width * W;
+      const i = n === 1 ? 0 : Math.round((vx - L) / (W - L - R) * (n - 1));
+      show(Math.max(0, Math.min(n - 1, i)));
+    });
+    hit.addEventListener("pointerleave", () => {
+      tip.style.display = "none"; xh.style.display = "none";
+      dot.setAttribute("cx", x(n - 1)); dot.setAttribute("cy", y(history[n - 1].inr));
+    });
+  }
+
+  let histResizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(histResizeTimer);
+    histResizeTimer = setTimeout(renderHistory, 150);
+  });
+
+  $("historyCsvBtn").addEventListener("click", () => {
+    if (!history || !history.length) return;
+    const blob = new Blob([historyCsv(history)], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "net-worth-history.csv";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
 
   // ---- Sync modal wiring ----
   const syncModal = $("syncModal");
