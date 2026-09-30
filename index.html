@@ -565,7 +565,7 @@
   </section>
 
   <p class="footer-note">
-    Prices &amp; USD/INR via Yahoo Finance (with proxy fallbacks) · Auto-refresh every 2 min · Cached locally so values persist if a fetch fails.
+    Prices &amp; USD/INR via Yahoo Finance (private proxy if configured, public proxy fallbacks) · Auto-refresh every 2 min · Cached locally so values persist if a fetch fails.
   </p>
 </div>
 
@@ -666,48 +666,70 @@
   }
 
   // ------------ Yahoo Finance fetch ------------
-  // Tries direct first, then falls back through public CORS proxies if blocked/rate-limited.
-  async function fetchYahoo(symbol) {
-    const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1m&range=1d&includePrePost=false`;
-    const targetA = `https://query1.finance.yahoo.com${path}`;
-    const targetB = `https://query2.finance.yahoo.com${path}`;
-    const enc = encodeURIComponent;
-    const urls = [
-      targetA,
-      targetB,
-      `https://corsproxy.io/?url=${enc(targetA)}`,
-      `https://api.allorigins.win/raw?url=${enc(targetA)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${enc(targetA)}`,
-      `https://thingproxy.freeboard.io/fetch/${targetA}`,
-      `https://corsproxy.io/?url=${enc(targetB)}`,
-      `https://api.allorigins.win/raw?url=${enc(targetB)}`
-    ];
-    let lastErr;
-    for (const url of urls) {
-      try {
-        const ctl = new AbortController();
-        const t = setTimeout(() => ctl.abort(), 8000);
-        const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
-        clearTimeout(t);
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        const j = await r.json();
-        const res = j?.chart?.result?.[0];
-        if (!res) throw new Error(j?.chart?.error?.description || "no result");
-        const meta = res.meta || {};
-        const price = meta.regularMarketPrice ?? meta.previousClose;
-        const prev = meta.chartPreviousClose ?? meta.previousClose ?? price;
-        if (price == null) throw new Error("no price");
-        return {
-          price, prevClose: prev,
-          name: meta.shortName || meta.longName || symbol,
-          currency: meta.currency || "USD",
-          ts: Date.now()
-        };
-      } catch (e) {
-        lastErr = e;
-      }
+  // Yahoo sends no CORS headers, so a browser on github.io can never call it directly.
+  //
+  // PRICE_PROXY: URL of your own Cloudflare Worker (see worker.js in this repo).
+  // When set, every Yahoo symbol is fetched in ONE request, usually in well under a second.
+  // Leave it empty to use the free public proxies below, which are slow and often down.
+  const PRICE_PROXY = "";
+
+  // Batched fetch through the private proxy. Returns { SYM: {price, prevClose, name, currency} }.
+  async function fetchYahooBatch(symbols) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const url = PRICE_PROXY.replace(/\/$/, "") + "/?symbols=" + symbols.map(encodeURIComponent).join(",");
+      const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw new Error("proxy HTTP " + r.status);
+      return await r.json();
+    } finally {
+      clearTimeout(t);
     }
-    throw lastErr || new Error("fetch failed");
+  }
+
+  function parseChart(j, symbol) {
+    const res = j?.chart?.result?.[0];
+    if (!res) throw new Error(j?.chart?.error?.description || "no result");
+    const meta = res.meta || {};
+    const price = meta.regularMarketPrice ?? meta.previousClose;
+    const prev = meta.chartPreviousClose ?? meta.previousClose ?? price;
+    if (price == null) throw new Error("no price");
+    return {
+      price, prevClose: prev,
+      name: meta.shortName || meta.longName || symbol,
+      currency: meta.currency || "USD",
+      ts: Date.now()
+    };
+  }
+
+  // Fallback: public CORS proxies, raced in parallel (first valid answer wins) instead of
+  // tried one after another with an 8s timeout each. interval=1d keeps the response ~1 KB
+  // (interval=1m returned ~400 data points we never used, which made proxies time out).
+  async function fetchYahoo(symbol) {
+    const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+    const enc = encodeURIComponent;
+    const A = `https://query1.finance.yahoo.com${path}`;
+    const B = `https://query2.finance.yahoo.com${path}`;
+    const urls = [
+      `https://api.allorigins.win/raw?url=${enc(A)}`,
+      `https://api.allorigins.win/raw?url=${enc(B)}`,
+      `https://api.codetabs.com/v1/proxy/?quest=${enc(A)}`
+    ];
+    const controllers = urls.map(() => new AbortController());
+    const timer = setTimeout(() => controllers.forEach(c => c.abort()), 9000);
+    try {
+      return await Promise.any(urls.map(async (url, i) => {
+        const r = await fetch(url, { cache: "no-store", signal: controllers[i].signal });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const out = parseChart(await r.json(), symbol);
+        controllers.forEach((c, k) => k !== i && c.abort());  // cancel the losers
+        return out;
+      }));
+    } catch (e) {
+      throw new Error("all proxies failed");
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ------------ Mutual Fund NAV (mfapi.in / AMFI) ------------
@@ -774,10 +796,19 @@
     let okCount = 0;
     const failed = [];
 
-    // Concurrency 3 — gentle on Yahoo + proxies, fast enough for 10–20 symbols.
-    await runLimited(uniq, 3, async (sym) => {
+    // With a private proxy, grab all Yahoo symbols in a single request first.
+    let batch = {};
+    if (PRICE_PROXY) {
       try {
-        const fresh = await fetchPrice(sym);
+        batch = await fetchYahooBatch(uniq.filter(s => !s.startsWith("MF:")));
+      } catch (e) { batch = {}; }
+    }
+
+    // Anything the batch didn't cover (funds, or proxy down) goes through the per-symbol path.
+    await runLimited(uniq, 6, async (sym) => {
+      try {
+        const b = batch[sym];
+        const fresh = (b && b.price != null) ? { ...b, ts: Date.now() } : await fetchPrice(sym);
         prices[sym] = fresh;          // overwrite with fresh data
         okCount++;
       } catch (e) {
