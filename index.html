@@ -2219,13 +2219,15 @@
       return;
     }
     const val = (r) => usd ? r.inr / r.fx : r.inr;
-    const axisFmt = (v) => usd ? "$" + (v / 1e6).toFixed(2) + " Mn" : (v / 1e7).toFixed(2) + " Cr";
 
     const W = Math.max(300, Math.round(box.clientWidth) || 800), H = 220, L = 64, R = 12, T = 12, B = 26;
     const vals = rows.map(val);
     let lo = Math.min(...vals), hi = Math.max(...vals);
     const pad = (hi - lo) * 0.1 || Math.max(hi * 0.01, usd ? 1e3 : 1e5);
     lo -= pad; hi += pad;
+    // Extra decimal when the axis steps are too small to tell apart at 2 places.
+    const unit = usd ? 1e6 : 1e7, dp = (hi - lo) / 3 / unit < 0.01 ? 3 : 2;
+    const axisFmt = (v) => usd ? "$" + (v / unit).toFixed(dp) + " Mn" : (v / unit).toFixed(dp) + " Cr";
     const n = rows.length;
     const x = (i) => n === 1 ? L + (W - L - R) / 2 : L + (i / (n - 1)) * (W - L - R);
     const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
