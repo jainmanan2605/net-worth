@@ -418,6 +418,17 @@
   .hist-tip .d { color: var(--muted); display: block; font-size: 11px; }
   .hist-empty { color: var(--muted); font-size: 13px; padding: 28px 0; text-align: center; }
   .hist-note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .hist-actions { display: inline-flex; gap: 8px; align-items: center; }
+  .ccy-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  #historyPanel h2 .ccy-toggle button {
+    border: 0; border-radius: 0; background: transparent; color: var(--muted);
+    padding: 6px 11px; font-size: 12px; font-weight: 600; min-width: 32px;
+  }
+  #historyPanel h2 .ccy-toggle button + button { border-left: 1px solid var(--border); }
+  #historyPanel h2 .ccy-toggle button[aria-pressed="true"] { background: var(--panel-2); color: var(--accent); }
+  .hist-change { color: var(--muted); font-size: 12.5px; margin: -2px 0 4px; font-variant-numeric: tabular-nums; }
+  .hist-change b { color: var(--text); font-weight: 600; }
+  .hist-change .up { color: var(--green); background: none; } .hist-change .down { color: var(--red); background: none; }
 </style>
 </head>
 <body>
@@ -584,7 +595,14 @@
 
   <section class="panel" id="historyPanel">
     <h2><span>History <span class="section-pct" id="historyMeta">—</span></span>
-      <button id="historyCsvBtn" disabled>Download CSV</button></h2>
+      <span class="hist-actions">
+        <span class="ccy-toggle" role="group" aria-label="Chart currency">
+          <button id="histInrBtn" aria-pressed="true" title="Show chart in rupees">₹</button>
+          <button id="histUsdBtn" aria-pressed="false" title="Show chart in dollars">$</button>
+        </span>
+        <button id="historyCsvBtn" disabled>Download CSV</button>
+      </span></h2>
+    <div class="hist-change" id="historyChange" style="display:none"></div>
     <div id="historyChart" class="hist-chart"><div class="hist-empty">Connect Sync to see your daily net worth history.</div></div>
     <p class="hist-note">Saved automatically at 11:30 PM IST each night. When you open this page before then, today's value is saved too, and the nightly figure replaces it.</p>
   </section>
@@ -2116,7 +2134,7 @@
       .filter((l) => /^\d{4}-\d{2}-\d{2},/.test(l))
       .map((l) => {
         const c = l.split(",");
-        return { date: c[0], inr: Number(c[1]), source: c[4] || "", time: c[5] || "", line: l };
+        return { date: c[0], inr: Number(c[1]), fx: Number(c[3]), source: c[4] || "", time: c[5] || "", line: l };
       })
       .filter((r) => isFinite(r.inr))
       .sort((a, b) => a.date.localeCompare(b.date));
@@ -2156,7 +2174,7 @@
       const inr = lastHeadline.inr;
       const line = [date, Math.round(inr), (inr / 1e7).toFixed(2), lastHeadline.usdInr.toFixed(2), "site", time].join(",");
       const next = rows.filter((r) => r.date !== date);
-      next.push({ date, inr: Math.round(inr), source: "site", time, line });
+      next.push({ date, inr: Math.round(inr), fx: Number(lastHeadline.usdInr.toFixed(2)), source: "site", time, line });
       next.sort((a, b) => a.date.localeCompare(b.date));
       const r = await fetch(`https://api.github.com/gists/${encodeURIComponent(sync.gistId)}`, {
         method: "PATCH",
@@ -2187,48 +2205,62 @@
     if (!history) return;
     btn.disabled = !history.length;
     $("historyMeta").textContent = history.length ? `${history.length} day${history.length > 1 ? "s" : ""}` : "—";
+    renderHistoryChange();
     if (!history.length) {
       box.innerHTML = '<div class="hist-empty">No history yet. The first entry is saved tonight at 11:30 PM IST.</div>';
       return;
     }
 
+    // Chart currency: USD values come from each day's own saved USD/INR rate.
+    const usd = histCcy === "USD";
+    const rows = usd ? history.filter((r) => r.fx > 0) : history;
+    if (!rows.length) {
+      box.innerHTML = '<div class="hist-empty">No USD/INR rate saved for these days.</div>';
+      return;
+    }
+    const val = (r) => usd ? r.inr / r.fx : r.inr;
+    const axisFmt = (v) => usd ? "$" + (v / 1e6).toFixed(2) + " Mn" : (v / 1e7).toFixed(2) + " Cr";
+
     const W = Math.max(300, Math.round(box.clientWidth) || 800), H = 220, L = 64, R = 12, T = 12, B = 26;
-    const vals = history.map((r) => r.inr);
+    const vals = rows.map(val);
     let lo = Math.min(...vals), hi = Math.max(...vals);
-    const pad = (hi - lo) * 0.1 || Math.max(hi * 0.01, 1e5);
+    const pad = (hi - lo) * 0.1 || Math.max(hi * 0.01, usd ? 1e3 : 1e5);
     lo -= pad; hi += pad;
-    const n = history.length;
+    const n = rows.length;
     const x = (i) => n === 1 ? L + (W - L - R) / 2 : L + (i / (n - 1)) * (W - L - R);
     const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
 
     const ticks = [0, 1, 2, 3].map((k) => lo + (k / 3) * (hi - lo));
     const grid = ticks.map((v) =>
       `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>` +
-      `<text class="axis-label" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${(v / 1e7).toFixed(2)} Cr</text>`).join("");
+      `<text class="axis-label" x="${L - 8}" y="${y(v) + 4}" text-anchor="end">${axisFmt(v)}</text>`).join("");
     const xl = n === 1
-      ? `<text class="axis-label" x="${x(0)}" y="${H - 6}" text-anchor="middle">${fmtDay(history[0].date, true)}</text>`
-      : `<text class="axis-label" x="${L}" y="${H - 6}">${fmtDay(history[0].date, true)}</text>` +
-        `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">${fmtDay(history[n - 1].date, true)}</text>`;
-    const pts = history.map((r, i) => `${x(i).toFixed(1)},${y(r.inr).toFixed(1)}`);
+      ? `<text class="axis-label" x="${x(0)}" y="${H - 6}" text-anchor="middle">${fmtDay(rows[0].date, true)}</text>`
+      : `<text class="axis-label" x="${L}" y="${H - 6}">${fmtDay(rows[0].date, true)}</text>` +
+        `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">${fmtDay(rows[n - 1].date, true)}</text>`;
+    const pts = rows.map((r, i) => `${x(i).toFixed(1)},${y(val(r)).toFixed(1)}`);
     const line = n > 1 ? `<path class="area" d="M${pts[0]} L${pts.join(" L")} L${x(n - 1)},${H - B} L${x(0)},${H - B} Z"/><polyline class="line" points="${pts.join(" ")}"/>` : "";
 
-    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Net worth by day">
+    box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Net worth by day, in ${usd ? "US dollars" : "rupees"}">
         ${grid}${xl}${line}
         <line class="xhair" id="histX" x1="0" x2="0" y1="${T}" y2="${H - B}" style="display:none"/>
-        <circle class="dot" id="histDot" r="5" cx="${x(n - 1)}" cy="${y(history[n - 1].inr)}"/>
+        <circle class="dot" id="histDot" r="5" cx="${x(n - 1)}" cy="${y(val(rows[n - 1]))}"/>
         <rect id="histHit" x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/>
       </svg><div class="hist-tip" id="histTip" style="display:none"></div>`;
 
     const svg = box.querySelector("svg"), tip = $("histTip"), dot = $("histDot"), xh = $("histX");
     const show = (i) => {
-      const r = history[i];
-      const px = x(i), py = y(r.inr);
+      const r = rows[i];
+      const px = x(i), py = y(val(r));
       dot.setAttribute("cx", px); dot.setAttribute("cy", py);
       xh.setAttribute("x1", px); xh.setAttribute("x2", px); xh.style.display = "";
       const sx = svg.clientWidth / W, sy = svg.clientHeight / H;
       tip.style.left = Math.min(Math.max(px * sx, 70), svg.clientWidth - 70) + "px";
       tip.style.top = (py * sy - 10) + "px";
-      tip.innerHTML = `<span class="d">${fmtDay(r.date, true)}${r.source === "site" ? " · saved " + r.time : ""}</span>${fmtCr(r.inr)}`;
+      const inrTxt = fmtCr(r.inr), usdTxt = r.fx > 0 ? fmtMn(r.inr / r.fx) : "";
+      const both = usd ? [usdTxt, inrTxt] : [inrTxt, usdTxt];
+      tip.innerHTML = `<span class="d">${fmtDay(r.date, true)}${r.source === "site" ? " · saved " + r.time : ""}</span>` +
+        `<b>${both[0]}</b>${both[1] ? ` <span class="d" style="display:inline">· ${both[1]}</span>` : ""}`;
       tip.style.display = "";
     };
     const hit = $("histHit");
@@ -2240,9 +2272,39 @@
     });
     hit.addEventListener("pointerleave", () => {
       tip.style.display = "none"; xh.style.display = "none";
-      dot.setAttribute("cx", x(n - 1)); dot.setAttribute("cy", y(history[n - 1].inr));
+      dot.setAttribute("cx", x(n - 1)); dot.setAttribute("cy", y(val(rows[n - 1])));
     });
   }
+
+  // "Since <first day>: +x% in ₹ · +y% in $" — the gap between the two is the currency effect.
+  function renderHistoryChange() {
+    const el = $("historyChange");
+    const first = history[0], last = history[history.length - 1];
+    if (history.length < 2 || !(first.inr > 0)) { el.style.display = "none"; return; }
+    const part = (a, b, sym) => {
+      const p = (b / a - 1) * 100;
+      const cls = p > 0.005 ? "up" : p < -0.005 ? "down" : "";
+      return `<b class="${cls}">${p >= 0 ? "+" : ""}${p.toFixed(1)}%</b> in ${sym}`;
+    };
+    let txt = `Since ${fmtDay(first.date, false)}: ${part(first.inr, last.inr, "₹")}`;
+    if (first.fx > 0 && last.fx > 0) txt += ` · ${part(first.inr / first.fx, last.inr / last.fx, "$")}`;
+    el.innerHTML = txt;
+    el.style.display = "";
+  }
+
+  let histCcy = "INR";
+  try { if (localStorage.getItem("netWorthHistCcy") === "USD") histCcy = "USD"; } catch (e) {}
+  function setHistCcy(c) {
+    histCcy = c;
+    try { localStorage.setItem("netWorthHistCcy", c); } catch (e) {}
+    $("histInrBtn").setAttribute("aria-pressed", String(c === "INR"));
+    $("histUsdBtn").setAttribute("aria-pressed", String(c === "USD"));
+    renderHistory();
+  }
+  $("histInrBtn").addEventListener("click", () => setHistCcy("INR"));
+  $("histUsdBtn").addEventListener("click", () => setHistCcy("USD"));
+  $("histInrBtn").setAttribute("aria-pressed", String(histCcy === "INR"));
+  $("histUsdBtn").setAttribute("aria-pressed", String(histCcy === "USD"));
 
   let histResizeTimer = null;
   window.addEventListener("resize", () => {
@@ -2252,7 +2314,14 @@
 
   $("historyCsvBtn").addEventListener("click", () => {
     if (!history || !history.length) return;
-    const blob = new Blob([historyCsv(history)], { type: "text/csv" });
+    const head = "Date,Net worth (INR),Net worth (Cr),Net worth (USD),Net worth (USD Mn),USD/INR,Source,Saved at (IST)";
+    const body = history.map((r) => {
+      const u = r.fx > 0 ? r.inr / r.fx : null;
+      return [r.date, Math.round(r.inr), (r.inr / 1e7).toFixed(2),
+        u == null ? "" : Math.round(u), u == null ? "" : (u / 1e6).toFixed(3),
+        r.fx > 0 ? r.fx.toFixed(2) : "", r.source, r.time].join(",");
+    });
+    const blob = new Blob([[head, ...body].join("\n") + "\n"], { type: "text/csv" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "net-worth-history.csv";
