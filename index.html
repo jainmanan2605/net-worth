@@ -671,6 +671,2134 @@
   // PRICE_PROXY: URL of your own Cloudflare Worker (see worker.js in this repo).
   // When set, every Yahoo symbol is fetched in ONE request, usually in well under a second.
   // Leave it empty to use the free public proxies below, which are slow and often down.
+  const PRICE_PROXY = "https://networth-prices.jainmanan2605.workers.dev";
+
+  // Batched fetch through the private proxy. Returns { SYM: {price, prevClose, name, currency} }.
+  async function fetchYahooBatch(symbols) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const url = PRICE_PROXY.replace(/\/$/, "") + "/?symbols=" + symbols.map(encodeURIComponent).join(",");
+      const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+      if (!r.ok) throw new Error("proxy HTTP " + r.status);
+      return await r.json();
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  function parseChart(j, symbol) {
+    const res = j?.chart?.result?.[0];
+    if (!res) throw new Error(j?.chart?.error?.description || "no result");
+    const meta = res.meta || {};
+    const price = meta.regularMarketPrice ?? meta.previousClose;
+    const prev = meta.chartPreviousClose ?? meta.previousClose ?? price;
+    if (price == null) throw new Error("no price");
+    return {
+      price, prevClose: prev,
+      name: meta.shortName || meta.longName || symbol,
+      currency: meta.currency || "USD",
+      ts: Date.now()
+    };
+  }
+
+  // Fallback: public CORS proxies, raced in parallel (first valid answer wins) instead of
+  // tried one after another with an 8s timeout each. interval=1d keeps the response ~1 KB
+  // (interval=1m returned ~400 data points we never used, which made proxies time out).
+  async function fetchYahoo(symbol) {
+    const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`;
+    const enc = encodeURIComponent;
+    const A = `https://query1.finance.yahoo.com${path}`;
+    const B = `https://query2.finance.yahoo.com${path}`;
+    const urls = [
+      `https://api.allorigins.win/raw?url=${enc(A)}`,
+      `https://api.allorigins.win/raw?url=${enc(B)}`,
+      `https://api.codetabs.com/v1/proxy/?quest=${enc(A)}`
+    ];
+    const controllers = urls.map(() => new AbortController());
+    const timer = setTimeout(() => controllers.forEach(c => c.abort()), 9000);
+    try {
+      return await Promise.any(urls.map(async (url, i) => {
+        const r = await fetch(url, { cache: "no-store", signal: controllers[i].signal });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const out = parseChart(await r.json(), symbol);
+        controllers.forEach((c, k) => k !== i && c.abort());  // cancel the losers
+        return out;
+      }));
+    } catch (e) {
+      throw new Error("all proxies failed");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ------------ Mutual Fund NAV (mfapi.in / AMFI) ------------
+  async function fetchFundNav(schemeCode) {
+    const url = `https://api.mfapi.in/mf/${encodeURIComponent(schemeCode)}`;
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 8000);
+    const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+    clearTimeout(t);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if (j.status !== "SUCCESS" || !j.data || !j.data.length) throw new Error("no NAV");
+    const latest = parseFloat(j.data[0].nav);
+    const prev = j.data[1] ? parseFloat(j.data[1].nav) : latest;
+    return {
+      price: latest, prevClose: prev,
+      name: j.meta?.scheme_name || schemeCode,
+      currency: "INR", ts: Date.now()
+    };
+  }
+
+  async function fetchFundSearch(q) {
+    const r = await fetch("https://api.mfapi.in/mf/search?q=" + encodeURIComponent(q), { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }
+
+  // Unified per-symbol fetch — dispatches to the right source.
+  // Symbols starting with "MF:" go to mfapi.in, everything else to Yahoo.
+  function fetchPrice(sym) {
+    if (sym.startsWith("MF:")) return fetchFundNav(sym.slice(3));
+    return fetchYahoo(sym);
+  }
+
+  // Run async tasks with limited concurrency to avoid hammering Yahoo / proxies.
+  async function runLimited(items, limit, worker) {
+    let i = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        await worker(items[idx], idx);
+      }
+    });
+    await Promise.all(runners);
+  }
+
+  let refreshing = false;
+  async function refreshAllPrices() {
+    if (refreshing) return;
+    refreshing = true;
+
+    // Always include INR=X for the FX rate
+    const symbols = [
+      "INR=X",
+      ...state.stocks.map(h => h.symbol),
+      ...state.metals.map(h => h.symbol),
+      ...state.funds.map(h => h.symbol)   // "MF:118566"
+    ];
+    const uniq = [...new Set(symbols)];
+
+    $("status").innerHTML = '<span class="spinner"></span> Updating';
+    $("refreshBtn").disabled = true;
+
+    let okCount = 0;
+    const failed = [];
+
+    // With a private proxy, grab all Yahoo symbols in a single request first.
+    let batch = {};
+    if (PRICE_PROXY) {
+      try {
+        batch = await fetchYahooBatch(uniq.filter(s => !s.startsWith("MF:")));
+      } catch (e) { batch = {}; }
+    }
+
+    // Anything the batch didn't cover (funds, or proxy down) goes through the per-symbol path.
+    await runLimited(uniq, 6, async (sym) => {
+      try {
+        const b = batch[sym];
+        const fresh = (b && b.price != null) ? { ...b, ts: Date.now() } : await fetchPrice(sym);
+        prices[sym] = fresh;          // overwrite with fresh data
+        okCount++;
+      } catch (e) {
+        // Keep the last-known price if we have it; just mark it stale.
+        if (prices[sym] && prices[sym].price != null) {
+          prices[sym].stale = true;
+          prices[sym].lastError = e.message;
+        } else {
+          prices[sym] = { error: e.message };
+        }
+        if (sym !== "INR=X") failed.push(sym);
+      }
+    });
+    savePrices();
+
+    // Update FX
+    const fx = prices["INR=X"];
+    if (fx && fx.price) {
+      usdInr = fx.price;
+      localStorage.setItem("usdInrRate", String(usdInr));
+    }
+
+    // Toast only for symbols we have NO data on at all (truly broken tickers)
+    const totallyMissing = failed.filter((s) => !(prices[s] && prices[s].price != null));
+    if (totallyMissing.length) {
+      toast("Could not fetch: " + totallyMissing.join(", ") + ". Check the ticker.", true);
+    } else if (failed.length) {
+      // We had to fall back to cached values — silent unless persistent.
+      $("status").textContent = "Using cached (rate-limited)";
+    }
+
+    if (!failed.length) $("status").textContent = "Updated";
+    $("refreshBtn").disabled = false;
+    $("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
+    render();
+    refreshing = false;
+  }
+
+  // ------------ Render ------------
+  function holdingValue(h) {
+    const p = prices[h.symbol];
+    if (!p || p.price == null) return { value: null, dayChange: null };
+    const ccy = p.currency || "USD";
+    const valueNative = p.price * h.qty;
+    const dayChangeNative = (p.price - p.prevClose) * h.qty;
+    // Unrealized gain (INR), only if purchase price is known on the holding.
+    let gainINR = null;
+    if (h.purchasePrice != null && h.purchasePrice > 0) {
+      const gainNative = (p.price - h.purchasePrice) * h.qty;
+      gainINR = toINR(gainNative, ccy);
+    }
+    return {
+      price: p.price, prev: p.prevClose, name: p.name, currency: ccy,
+      valueNative, dayChangeNative,
+      valueINR: toINR(valueNative, ccy),
+      dayChangeINR: toINR(dayChangeNative, ccy),
+      gainINR
+    };
+  }
+
+  // ------------ Projection ("what if") ------------
+  // Each holding may carry a `target`: a target price for stocks, NAV for
+  // funds, price-per-troy-oz for metals, or a flat amount for cash/debt rows.
+  // Holdings without a target are projected at their current value, so a
+  // scenario reads as "these move, everything else holds".
+
+  const hasTarget = (h) => h && h.target != null && !isNaN(h.target);
+
+  // ------------ Horizon parsing ------------
+  // The horizon stays free text, but where it can be read as a date we can
+  // annualise the gap between current and potential. Understood forms:
+  //   FY28 / FY2028      -> 31 Mar 2028 (Indian fiscal year end)
+  //   Mar 2030 / Dec-29  -> last day of that month
+  //   2028               -> 31 Dec 2028
+  //   3 years / 18 months-> that far from today
+  // First match wins, so "end of FY28 / early FY29" resolves to FY28.
+  const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+                  "jul", "aug", "sep", "oct", "nov", "dec"];
+
+  const fullYear = (y) => (y < 100 ? 2000 + y : y);
+  const endOfMonth = (y, m) => new Date(y, m + 1, 0, 23, 59, 59);
+
+  function parseHorizon(text) {
+    if (!text) return null;
+    const s = String(text).trim().toLowerCase();
+
+    // Indian fiscal year: FY28 ends 31 March 2028
+    let m = s.match(/\bfy\s*'?\s*(\d{2}|\d{4})\b/);
+    if (m) return endOfMonth(fullYear(+m[1]), 2);
+
+    // Month name with a year: "mar 2030", "dec-29", "march 2030"
+    m = s.match(new RegExp(`\\b(${MONTHS.join("|")})[a-z]*\\.?[\\s\\-/,]*'?(\\d{2}|\\d{4})\\b`));
+    if (m) return endOfMonth(fullYear(+m[2]), MONTHS.indexOf(m[1]));
+
+    // Bare calendar year
+    m = s.match(/\b(20\d{2})\b/);
+    if (m) return endOfMonth(+m[1], 11);
+
+    // Relative durations
+    m = s.match(/\b(\d+(?:\.\d+)?)\s*(years?|yrs?|y)\b/);
+    if (m) {
+      const d = new Date();
+      d.setDate(d.getDate() + Math.round(parseFloat(m[1]) * 365.25));
+      return d;
+    }
+    m = s.match(/\b(\d+)\s*(months?|mos?|mths?)\b/);
+    if (m) {
+      const d = new Date();
+      d.setMonth(d.getMonth() + +m[1]);
+      return d;
+    }
+    return null;
+  }
+
+  const MS_PER_YEAR = 365.25 * 24 * 60 * 60 * 1000;
+
+  // Annualised rate from current to potential over the horizon. With a single
+  // start and end value and no cash flows between, IRR reduces to CAGR.
+  // Undefined if either end is non-positive — you can't annualise a move
+  // through zero — or if the date is too close to be meaningful.
+  function annualisedRate(current, potential, when) {
+    if (!when) return { ok: false, why: "unparsed" };
+    const years = (when.getTime() - Date.now()) / MS_PER_YEAR;
+    if (years <= 0) return { ok: false, why: "past", when };
+    if (years < 0.08) return { ok: false, why: "tooClose", when, years };
+    if (!(current > 0) || !(potential > 0)) return { ok: false, why: "nonPositive", when, years };
+    return { ok: true, when, years, rate: (Math.pow(potential / current, 1 / years) - 1) * 100 };
+  }
+
+  const fmtDate = (d) =>
+    `${d.getDate()} ${MONTHS[d.getMonth()].replace(/^./, (c) => c.toUpperCase())} ${d.getFullYear()}`;
+
+  // Currency for a symbol. Normally from the price cache; the fallback only
+  // matters when a target is set on a holding whose price fetch failed.
+  function currencyFor(sym) {
+    const p = prices[sym];
+    if (p && p.currency) return p.currency;
+    // Indian listings and AMFI mutual funds are INR; everything else (US
+    // tickers, the GC=F/SI=F metal futures) quotes in USD.
+    if (/^MF:/i.test(sym) || /\.(NS|BO)$/i.test(sym)) return "INR";
+    return "USD";
+  }
+
+  // Value of a holding at its target price, in INR. Falls back to the current
+  // value when no target is set; null when neither is knowable.
+  function projectedHolding(h) {
+    const ccy = currencyFor(h.symbol);
+    if (hasTarget(h)) {
+      const valueNative = Number(h.target) * h.qty;
+      let gainINR = null;
+      if (h.purchasePrice != null && h.purchasePrice > 0) {
+        gainINR = toINR((Number(h.target) - h.purchasePrice) * h.qty, ccy);
+      }
+      return { valueINR: toINR(valueNative, ccy), gainINR, currency: ccy };
+    }
+    const v = holdingValue(h);
+    return { valueINR: v.valueINR, gainINR: v.gainINR, currency: ccy };
+  }
+
+  const projectedAmount = (c) =>
+    toINR(Number(hasTarget(c) ? c.target : c.amount) || 0, c.currency || "INR");
+
+  function anyTargets() {
+    return ["stocks", "funds", "metals", "cash", "debt"]
+      .some((k) => (state[k] || []).some(hasTarget));
+  }
+
+  // Which state array a row `kind` refers to.
+  function listFor(kind) {
+    return kind === "stock" ? state.stocks
+         : kind === "fund"  ? state.funds
+         : kind === "metal" ? state.metals
+         : kind === "cash"  ? state.cash
+         : kind === "debt"  ? state.debt
+         : null;
+  }
+
+  // A row's share of its section and of the whole. A section holding both
+  // assets and liabilities (an FD next to a home loan) can net to zero or a
+  // negative, and a share of a negative base is meaningless — "-185.7% of
+  // debt" tells you nothing — so the section share is dropped in that case
+  // and only the portfolio share is shown.
+  function shareText(valueINR, sectionINR, grandINR, sectLabel, totalWord) {
+    const totalShare = grandINR ? (valueINR / grandINR * 100) : 0;
+    const parts = [];
+    if (sectionINR > 0) parts.push(`${(valueINR / sectionINR * 100).toFixed(1)}% of ${sectLabel}`);
+    parts.push(`${totalShare.toFixed(1)}% of ${totalWord}`);
+    return parts.join(" · ");
+  }
+
+  // The "at target" line under a row's value: what the holding would be worth
+  // and the share of the portfolio it would then represent. Shares are taken
+  // against the projected totals, so a row's target share reflects every other
+  // target too, not just its own.
+  function projectedValueLine(valueNative, valueINR, ccy, projSectionINR, projGrandINR, sectLabel) {
+    if (valueINR == null) return "";
+    return `<div class="proj-line">` +
+      `<span class="proj-arrow">&#8594;</span> <strong>${fmtNative(valueNative, ccy)}</strong>` +
+      (ccy !== "INR" ? ` <span class="proj-inr">${fmtCr(valueINR)}</span>` : "") +
+      `<span class="pct-line">${shareText(valueINR, projSectionINR, projGrandINR, sectLabel, "potential")}</span>` +
+      `</div>`;
+  }
+
+  // Drag handle + remove cluster shared by every section's rows.
+  // Single-row sections have nothing to reorder, so the handle is inert there.
+  function rowActions(kind, i, n, extra) {
+    const lone = n < 2 ? " disabled" : "";
+    return `<div class="row-actions">` +
+      (extra || "") +
+      `<button class="drag-handle" data-drag="${kind}:${i}"${lone}` +
+        ` title="Drag to reorder (or focus and use ↑ / ↓)" aria-label="Reorder row">&#10303;</button>` +
+      `<button class="icon danger" data-del="${kind}:${i}" title="Remove" aria-label="Remove">&#10005;</button>` +
+      `</div>`;
+  }
+
+  function renderTable(list, kind, sectionINR, grandINR, projSectionINR, projGrandINR) {
+    if (!list.length) {
+      return `<div class="empty">No ${kind} added yet. Add one below.</div>`;
+    }
+    const isStock = kind === "stock";
+    const rows = list.map((h, i) => {
+      const v = holdingValue(h);
+      const ready = v && v.valueNative != null;
+      const stale = prices[h.symbol]?.stale;
+      const staleTag = stale ? ` <span class="meta" title="Cached value — fresh fetch failed">·cached</span>` : "";
+      const priceCell = !ready
+        ? (prices[h.symbol]?.error ? `<span style="color:var(--red)" title="${escapeHtml(prices[h.symbol].error)}">err</span>` : `<span class="meta">…</span>`)
+        : fmtNative(v.price, v.currency) + staleTag;
+
+      const sectLabel = kind === "stock" ? "stocks" : kind === "fund" ? "funds" : "metals";
+
+      // Per-row percentages
+      let pctLine = "";
+      if (ready) {
+        pctLine = `<span class="pct-line">${shareText(v.valueINR, sectionINR, grandINR, sectLabel, "total")}</span>`;
+      }
+
+      const tCcy = ready ? v.currency : currencyFor(h.symbol);
+
+      // What this row is worth at its target, and the share it would then
+      // occupy — measured against the projected totals, not today's.
+      const projLine = hasTarget(h)
+        ? projectedValueLine(Number(h.target) * h.qty, projectedHolding(h).valueINR,
+                             tCcy, projSectionINR, projGrandINR, sectLabel)
+        : "";
+
+      const valCell = (!ready
+        ? (projLine ? "" : "—")
+        : `<strong>${fmtNative(v.valueNative, v.currency)}</strong>` +
+          (v.currency !== "INR" ? `<div class="meta">${fmtCr(v.valueINR)}</div>` : "") +
+          pctLine) + projLine;
+
+      // Target price cell — click to set a "what if" price for this holding.
+      let targetCell;
+      if (hasTarget(h)) {
+        const base = ready ? v.price : null;
+        const deltaPct = base ? ((Number(h.target) - base) / base) * 100 : null;
+        const dCls = deltaPct == null ? "" : deltaPct >= 0 ? "gain-up" : "gain-down";
+        targetCell = `<span class="target-set">${fmtNative(Number(h.target), tCcy)}</span>` +
+          (deltaPct == null ? "" :
+            `<span class="target-delta ${dCls}">${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%</span>`);
+      } else {
+        targetCell = `<span class="target-unset">set</span>`;
+      }
+
+      const dayPct = ready && v.prev ? ((v.price - v.prev) / v.prev) * 100 : 0;
+      const dayCls = dayPct > 0.0001 ? "up" : dayPct < -0.0001 ? "down" : "flat";
+      const dayCell = !ready ? "—" :
+        `<span class="${dayCls}">${pct(dayPct)}<div class="meta">${v.dayChangeNative >= 0 ? "+" : ""}${fmtNative(v.dayChangeNative, v.currency)}</div></span>`;
+
+      // Buy price cell (stocks only) — click to edit
+      let buyCell = "";
+      if (isStock) {
+        if (h.purchasePrice != null && h.purchasePrice > 0) {
+          const gainHtml = ready && v.gainINR != null
+            ? `<div class="pct-line ${v.gainINR >= 0 ? "gain-up" : "gain-down"}">${v.gainINR >= 0 ? "+" : ""}${fmtCr(v.gainINR)}</div>`
+            : "";
+          buyCell = `<td class="num hide-sm buy-cell" data-edit-buy="${i}">${fmtNative(h.purchasePrice, ready ? v.currency : "INR")}${gainHtml}</td>`;
+        } else {
+          buyCell = `<td class="num hide-sm buy-cell buy-set" data-edit-buy="${i}">set</td>`;
+        }
+      }
+
+      let primary, secondary;
+      if (kind === "fund") {
+        primary = h.name || (ready ? v.name : h.symbol);
+        secondary = `<div class="meta">${escapeHtml(h.symbol.replace(/^MF:/, "AMFI #"))}</div>`;
+      } else {
+        primary = h.symbol;
+        secondary = ready && v.name && v.name !== h.symbol ? `<div class="meta">${escapeHtml(v.name)}</div>` : "";
+      }
+      // Stocks can be marked exempt from the LTCG provision (a holding whose
+      // gain isn't taxable for you). Flagged on the row so it's never a
+      // silent assumption sitting behind the headline number.
+      const exemptTag = (isStock && h.noTax)
+        ? `<span class="exempt-tag" title="Gain excluded from the LTCG estimate">LTCG exempt</span>`
+        : "";
+
+      const taxBtn = isStock
+        ? `<button class="icon tax-toggle${h.noTax ? " exempt" : ""}" data-tax="${i}"` +
+          ` title="${h.noTax
+              ? "Exempt from LTCG — click to include this holding's gain again"
+              : "Taxed in the LTCG estimate — click to exempt this holding"}"` +
+          ` aria-pressed="${h.noTax ? "true" : "false"}" aria-label="Toggle LTCG exemption">%</button>`
+        : "";
+
+      return `
+        <tr>
+          <td>
+            <div class="sym">${escapeHtml(primary)}${exemptTag}</div>
+            ${secondary}
+          </td>
+          <td class="num">
+            <span class="editable" data-edit-qty="${kind}:${i}" title="Click to edit ${kind === "fund" ? "units" : kind === "metal" ? "troy oz" : "qty"}">${h.qty}${kind === "metal" ? " oz" : ""}</span>
+            ${kind === "metal" ? `<div class="meta editable" data-edit-gm="${i}" title="Click to edit (grams)">${fmtGm(ozToGm(h.qty))}</div>` : ""}
+          </td>
+          <td class="num hide-sm">${priceCell}</td>
+          ${buyCell}
+          <td class="num hide-sm">${dayCell}</td>
+          <td class="num target-cell" data-edit-target="${kind}:${i}" title="Click to set a target ${kind === "fund" ? "NAV" : "price"}">${targetCell}</td>
+          <td class="num">${valCell}</td>
+          <td class="num">${rowActions(kind, i, list.length, taxBtn)}</td>
+        </tr>`;
+    }).join("");
+    const headLabel = kind === "fund" ? "Fund" : "Symbol";
+    const qtyLabel  = kind === "fund" ? "Units" : "Qty";
+    const priceLabel = kind === "fund" ? "NAV" : "Price";
+    const buyHead = isStock ? `<th class="num hide-sm">Buy</th>` : "";
+    return `
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>${headLabel}</th>
+            <th class="num">${qtyLabel}</th>
+            <th class="num hide-sm">${priceLabel}</th>
+            ${buyHead}
+            <th class="num hide-sm">Day</th>
+            <th class="num">Target</th>
+            <th class="num">Value</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      </div>`;
+  }
+
+  // Used for both cash and debt — same shape (label, amount, currency).
+  function renderManualTable(entries, kindKey, sectionINR, grandINR, projSectionINR, projGrandINR) {
+    const sectLabel = kindKey;   // "cash" or "debt"
+    const emptyMsg = kindKey === "debt"
+      ? "No debt holdings yet. Add an FD, PPF, NPS, or bond below."
+      : "No cash or other entries yet.";
+    if (!entries.length) {
+      return `<div class="empty">${emptyMsg}</div>`;
+    }
+    const rows = entries.map((c, i) => {
+      const ccy = c.currency || "INR";
+      const inr = toINR(c.amount, ccy);
+      const pctLine = `<span class="pct-line">${shareText(inr, sectionINR, grandINR, sectLabel, "total")}</span>`;
+
+      const projLine = hasTarget(c)
+        ? projectedValueLine(Number(c.target), projectedAmount(c), ccy,
+                             projSectionINR, projGrandINR, sectLabel)
+        : "";
+
+      // Target amount — e.g. an FD's maturity value, or a loan paid down.
+      let targetCell;
+      if (hasTarget(c)) {
+        const base = Number(c.amount) || 0;
+        const deltaPct = base !== 0 ? ((Number(c.target) - base) / Math.abs(base)) * 100 : null;
+        const dCls = deltaPct == null ? "" : deltaPct >= 0 ? "gain-up" : "gain-down";
+        targetCell = `<span class="target-set">${fmtNative(Number(c.target), ccy)}</span>` +
+          (deltaPct == null ? "" :
+            `<span class="target-delta ${dCls}">${deltaPct >= 0 ? "+" : ""}${deltaPct.toFixed(1)}%</span>`);
+      } else {
+        targetCell = `<span class="target-unset">set</span>`;
+      }
+
+      return `
+      <tr>
+        <td><div class="sym editable" data-edit-label="${kindKey}:${i}" title="Click to edit label">${escapeHtml(c.label)}</div><div class="meta">${ccy}</div></td>
+        <td class="num editable" data-edit-amt="${kindKey}:${i}" title="Click to edit amount"><strong>${fmtNative(c.amount, ccy)}</strong>${ccy !== "INR" ? `<div class="meta">${fmtCr(inr)}</div>` : ""}${pctLine}${projLine}</td>
+        <td class="num target-cell" data-edit-target="${kindKey}:${i}" title="Click to set a target amount">${targetCell}</td>
+        <td class="num">${rowActions(kindKey, i, entries.length)}</td>
+      </tr>`;
+    }).join("");
+    return `
+      <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Label</th><th class="num">Amount</th><th class="num">Target</th><th></th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      </div>`;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  // True while an inline label input is open or a row is being dragged, so the
+  // 2-minute price refresh can't re-render the table out from under the user.
+  let suppressRender = false;
+
+  function render() {
+    if (suppressRender) return;
+    // ---- 1. Sum everything in INR up-front (so per-row %s can use it) ----
+    let stocksINR = 0, metalsINR = 0, fundsINR = 0, debtINR = 0, cashINR = 0;
+    let stocksDayINR = 0, metalsDayINR = 0, fundsDayINR = 0;
+    let stocksGainINR = 0;   // net unrealized gain across stocks (where buy price set)
+
+    state.stocks.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) {
+        stocksINR += v.valueINR;
+        stocksDayINR += v.dayChangeINR || 0;
+        // Holdings marked exempt still count toward net worth; only their
+        // gain stays out of the taxable base.
+        if (v.gainINR != null && !h.noTax) stocksGainINR += v.gainINR;   // signed; can be negative
+      }
+    });
+    state.funds.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) { fundsINR += v.valueINR; fundsDayINR += v.dayChangeINR || 0; }
+    });
+    state.metals.forEach((h) => {
+      const v = holdingValue(h);
+      if (v.valueINR != null) { metalsINR += v.valueINR; metalsDayINR += v.dayChangeINR || 0; }
+    });
+    state.debt.forEach((c) => {
+      debtINR += toINR(Number(c.amount) || 0, c.currency || "INR");
+    });
+    state.cash.forEach((c) => {
+      cashINR += toINR(Number(c.amount) || 0, c.currency || "INR");
+    });
+
+    const grossTotalINR = stocksINR + fundsINR + debtINR + metalsINR + cashINR;
+
+    // ---- 2. LTCG provisioning (discreet) ----
+    // Net stocks (gains - losses), net funds (current value - total invested).
+    // Tax only the positive of stocks-net + funds-net combined.
+    const fundsGainINR = state.fundsPurchase > 0 ? (fundsINR - Number(state.fundsPurchase)) : 0;
+    const totalGainINR = stocksGainINR + fundsGainINR;
+    const taxRate = Math.max(0, Math.min(50, Number(state.taxRate) || 0));
+    const ltcgTaxINR = totalGainINR > 0 ? (totalGainINR * taxRate / 100) : 0;
+
+    // ---- 3. After-tax NW (the headline number) ----
+    const totalINR = grossTotalINR - ltcgTaxINR;
+    const totalUSD = totalINR / usdInr;
+    const dayDeltaINR = stocksDayINR + fundsDayINR + metalsDayINR;
+    const totalPrevINR = grossTotalINR - dayDeltaINR;   // gross prev for % calc; tax shifts both sides
+
+    // ---- 3b. Projected ("potential") net worth at target prices ----
+    // Same arithmetic as above, but every holding is valued at its target
+    // where one is set. Tax is recomputed on the projected gains, so the
+    // potential figure is after-tax and comparable to the headline.
+    let projStocksINR = 0, projFundsINR = 0, projMetalsINR = 0, projDebtINR = 0, projCashINR = 0;
+    let projStocksGainINR = 0;
+
+    state.stocks.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) {
+        projStocksINR += p.valueINR;
+        if (p.gainINR != null && !h.noTax) projStocksGainINR += p.gainINR;
+      }
+    });
+    state.funds.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) projFundsINR += p.valueINR;
+    });
+    state.metals.forEach((h) => {
+      const p = projectedHolding(h);
+      if (p.valueINR != null) projMetalsINR += p.valueINR;
+    });
+    state.debt.forEach((c) => { projDebtINR += projectedAmount(c); });
+    state.cash.forEach((c) => { projCashINR += projectedAmount(c); });
+
+    const projGrossINR = projStocksINR + projFundsINR + projDebtINR + projMetalsINR + projCashINR;
+    const projFundsGainINR = state.fundsPurchase > 0 ? (projFundsINR - Number(state.fundsPurchase)) : 0;
+    const projTotalGainINR = projStocksGainINR + projFundsGainINR;
+    const projLtcgTaxINR = projTotalGainINR > 0 ? (projTotalGainINR * taxRate / 100) : 0;
+    const projTotalINR = projGrossINR - projLtcgTaxINR;
+
+    // ---- 4. Render tables now that we have section + grand totals ----
+    $("stocksTable").innerHTML = renderTable(state.stocks, "stock", stocksINR, grossTotalINR, projStocksINR, projGrossINR);
+    $("fundsTable").innerHTML = renderTable(state.funds, "fund", fundsINR, grossTotalINR, projFundsINR, projGrossINR);
+    $("metalsTable").innerHTML = renderTable(state.metals, "metal", metalsINR, grossTotalINR, projMetalsINR, projGrossINR);
+    $("debtTable").innerHTML = renderManualTable(state.debt, "debt", debtINR, grossTotalINR, projDebtINR, projGrossINR);
+    $("cashTable").innerHTML = renderManualTable(state.cash, "cash", cashINR, grossTotalINR, projCashINR, projGrossINR);
+
+    // ---- 5. Header / legend / totals ----
+    // Section totals; sections carrying targets also show where they'd land.
+    const setSectionTotal = (id, cur, proj, list) => {
+      const el = $(id);
+      el.textContent = fmtBoth(cur);
+      if ((list || []).some(hasTarget)) {
+        const s = document.createElement("span");
+        s.className = "section-proj";
+        s.textContent = "→ " + fmtCr(proj);
+        el.appendChild(document.createTextNode(" "));
+        el.appendChild(s);
+      }
+    };
+    setSectionTotal("stocksTotal", stocksINR, projStocksINR, state.stocks);
+    setSectionTotal("fundsTotal", fundsINR, projFundsINR, state.funds);
+    setSectionTotal("debtTotal", debtINR, projDebtINR, state.debt);
+    setSectionTotal("metalsTotal", metalsINR, projMetalsINR, state.metals);
+    setSectionTotal("cashTotal", cashINR, projCashINR, state.cash);
+
+    // Potential panel — only present once at least one target exists, and
+    // always alongside the current headline, never replacing it.
+    const showProj = anyTargets();
+    $("heroProjection").style.display = showProj ? "" : "none";
+    if (showProj) {
+      $("projValueInr").textContent = fmtCr(projTotalINR);
+      $("projValueUsd").textContent = fmtMn(projTotalINR / usdInr);
+      const deltaINR = projTotalINR - totalINR;
+      const deltaPct = totalINR !== 0 ? (deltaINR / Math.abs(totalINR)) * 100 : 0;
+      const dEl = $("projDelta");
+      dEl.className = "proj-delta " + (deltaINR > 0.5 ? "up" : deltaINR < -0.5 ? "down" : "flat");
+      const sign = deltaINR >= 0 ? "+" : "−";
+      dEl.textContent = `${sign}${fmtCr(Math.abs(deltaINR))} (${sign}${Math.abs(deltaPct).toFixed(1)}%)`;
+      const hz = $("projHorizon");
+      hz.textContent = state.horizon || "when?";
+      hz.classList.toggle("unset", !state.horizon);
+
+      // Annualised rate implied by the horizon, where one can be read from it.
+      const irrEl = $("projIrr");
+      const r = annualisedRate(totalINR, projTotalINR, parseHorizon(state.horizon));
+      if (r.ok) {
+        const cls = r.rate >= 0 ? "gain-up" : "gain-down";
+        irrEl.innerHTML =
+          `<span class="irr-rate ${cls}">${r.rate >= 0 ? "+" : ""}${r.rate.toFixed(1)}% a year</span>` +
+          `<span class="irr-basis">needed by ${escapeHtml(fmtDate(r.when))}` +
+          ` · ${r.years.toFixed(1)} yrs · assumes no further investment</span>`;
+      } else if (!state.horizon) {
+        irrEl.innerHTML = "";
+      } else if (r.why === "unparsed") {
+        irrEl.innerHTML = `<span class="irr-basis">Add a year — "FY28", "Mar 2030", "3 years" — for an annualised rate.</span>`;
+      } else if (r.why === "past") {
+        irrEl.innerHTML = `<span class="irr-basis">${escapeHtml(fmtDate(r.when))} has already passed.</span>`;
+      } else if (r.why === "tooClose") {
+        irrEl.innerHTML = `<span class="irr-basis">Too near to annualise meaningfully.</span>`;
+      } else {
+        irrEl.innerHTML = `<span class="irr-basis">Can't annualise across a zero or negative net worth.</span>`;
+      }
+
+      const n = ["stocks", "funds", "metals", "cash", "debt"]
+        .reduce((a, k) => a + (state[k] || []).filter(hasTarget).length, 0);
+      $("projNote").textContent =
+        `${n} target${n === 1 ? "" : "s"} set · everything else held at today's value` +
+        (projLtcgTaxINR > 0 ? ` · net of est. LTCG ${fmtCr(projLtcgTaxINR)}` : "");
+    }
+
+    $("totalValueInr").textContent = fmtCr(totalINR);
+    $("totalValueUsd").textContent = fmtMn(totalUSD);
+    $("fxPill").textContent = "USD/INR " + usdInr.toFixed(2);
+
+    $("legend-stocks").textContent = fmtCr(stocksINR);
+    $("legend-funds").textContent = fmtCr(fundsINR);
+    $("legend-debt").textContent = fmtCr(debtINR);
+    $("legend-metals").textContent = fmtCr(metalsINR);
+    $("legend-cash").textContent = fmtCr(cashINR);
+
+    // ---- 5b. Per-section % of total badges in section headers ----
+    const setPct = (id, val) => {
+      const p = grossTotalINR > 0 ? (val / grossTotalINR * 100) : 0;
+      $(id).textContent = p.toFixed(1) + "% of total";
+    };
+    setPct("stocksPct", stocksINR);
+    setPct("fundsPct", fundsINR);
+    setPct("debtPct", debtINR);
+    setPct("metalsPct", metalsINR);
+    setPct("cashPct", cashINR);
+
+    // ---- 6. Discreet tax caption + tax rate input value ----
+    if ($("taxRate") !== document.activeElement) {
+      $("taxRate").value = taxRate;
+    }
+    // Say how many holdings are being left out, so an exemption can never
+    // quietly shrink the provision without it being visible.
+    const exemptCount = state.stocks.filter((h) => h.noTax).length;
+    const exemptNote = exemptCount
+      ? ` · ${exemptCount} holding${exemptCount === 1 ? "" : "s"} exempt`
+      : "";
+    $("taxText").textContent = (ltcgTaxINR > 0
+      ? `Net of est. LTCG: −${fmtCr(ltcgTaxINR)}`
+      : "Net of est. LTCG: —") + exemptNote;
+
+    // Funds gain text next to total invested input
+    if (state.fundsPurchase > 0) {
+      const sign = fundsGainINR >= 0 ? "+" : "";
+      const cls = fundsGainINR >= 0 ? "gain-up" : "gain-down";
+      const pctG = state.fundsPurchase > 0 ? (fundsGainINR / state.fundsPurchase * 100) : 0;
+      $("fundsGain").innerHTML = `→ Gain: <span class="${cls}">${sign}${fmtCr(fundsGainINR)} (${pctG >= 0 ? "+" : ""}${pctG.toFixed(2)}%)</span>`;
+    } else {
+      $("fundsGain").textContent = "";
+    }
+    if ($("fundsPurchase") !== document.activeElement) {
+      $("fundsPurchase").value = state.fundsPurchase || "";
+    }
+
+    // Day change pill (in INR)
+    const dayPct = totalPrevINR > 0 ? (dayDeltaINR / totalPrevINR) * 100 : 0;
+    const dayEl = $("totalDay");
+    dayEl.classList.remove("up", "down", "flat");
+    if (Math.abs(dayDeltaINR) < 1) {
+      dayEl.classList.add("flat");
+      dayEl.textContent = "Today: —";
+    } else {
+      dayEl.classList.add(dayDeltaINR >= 0 ? "up" : "down");
+      const sign = dayDeltaINR >= 0 ? "+" : "";
+      dayEl.textContent = `Today: ${sign}${fmtCr(dayDeltaINR)} (${pct(dayPct)})`;
+    }
+
+    // Breakdown bar — gross totals (the bar sums section totals, not after-tax NW)
+    const bd = $("breakdown");
+    bd.innerHTML = "";
+    if (grossTotalINR > 0) {
+      const seg = (color, val) => {
+        if (val <= 0) return;
+        const d = document.createElement("div");
+        d.style.width = (val / grossTotalINR * 100) + "%";
+        d.style.background = color;
+        bd.appendChild(d);
+      };
+      seg("#6ea8fe", stocksINR);
+      seg("#34d399", fundsINR);
+      seg("var(--gold)", metalsINR);
+      seg("#a78bfa", cashINR);
+      seg("#f59e0b", debtINR);
+    }
+  }
+
+  // ------------ Events ------------
+  $("refreshBtn").addEventListener("click", refreshAllPrices);
+
+  $("addStockBtn").addEventListener("click", () => {
+    const sym = ($("stockSym").value || "").trim().toUpperCase();
+    const qty = parseFloat($("stockQty").value);
+    const buyRaw = $("stockBuy").value;
+    const buy = buyRaw === "" ? null : parseFloat(buyRaw);
+    if (!sym) return toast("Enter a ticker symbol", true);
+    if (!qty || qty <= 0) return toast("Enter a positive share count", true);
+    if (buy != null && (isNaN(buy) || buy < 0)) return toast("Invalid purchase price", true);
+    const entry = { symbol: sym, qty };
+    if (buy != null && buy > 0) entry.purchasePrice = buy;
+    state.stocks.push(entry);
+    save();
+    $("stockSym").value = ""; $("stockQty").value = ""; $("stockBuy").value = "";
+    refreshAllPrices();
+  });
+
+  // Tax rate input — debounced save
+  $("taxRate").addEventListener("input", () => {
+    const v = parseFloat($("taxRate").value);
+    state.taxRate = isNaN(v) ? 0 : Math.max(0, Math.min(50, v));
+    save();
+    render();
+  });
+
+  // Funds purchase value — debounced save
+  $("fundsPurchase").addEventListener("input", () => {
+    const v = parseFloat($("fundsPurchase").value);
+    state.fundsPurchase = isNaN(v) ? 0 : Math.max(0, v);
+    save();
+    render();
+  });
+
+  // Click-to-edit (purchase price + qty/units + amount). All use prompt for simplicity.
+  document.body.addEventListener("click", (e) => {
+    // 1. Stock purchase price
+    const buyCell = e.target.closest("[data-edit-buy]");
+    if (buyCell) {
+      const idx = +buyCell.dataset.editBuy;
+      const h = state.stocks[idx];
+      if (!h) return;
+      const cur = h.purchasePrice != null ? h.purchasePrice : "";
+      const next = window.prompt(
+        `Average purchase price for ${h.symbol} (in its native currency, blank to clear):`,
+        cur
+      );
+      if (next === null) return;
+      if (next.trim() === "") { delete h.purchasePrice; save(); render(); return; }
+      const v = parseFloat(next);
+      if (isNaN(v) || v < 0) return toast("Invalid number", true);
+      h.purchasePrice = v;
+      save(); render();
+      return;
+    }
+
+    // 2. Qty / units (stocks, funds, metals)
+    const qtyCell = e.target.closest("[data-edit-qty]");
+    if (qtyCell) {
+      const [kind, i] = qtyCell.dataset.editQty.split(":");
+      const list = kind === "stock" ? state.stocks : kind === "fund" ? state.funds : state.metals;
+      const h = list[+i];
+      if (!h) return;
+      const label = kind === "fund" ? "units" : kind === "metal" ? "troy ounces" : "shares";
+      const niceName = kind === "fund" ? (h.name || h.symbol.replace(/^MF:/, "AMFI #")) : h.symbol;
+      const next = window.prompt(`New ${label} for ${niceName}:`, h.qty);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v) || v <= 0) return toast(`Invalid ${label}`, true);
+      h.qty = v;
+      save(); render();
+      return;
+    }
+
+    // 2b. Grams (metals only — converts to troy oz internally)
+    const gmCell = e.target.closest("[data-edit-gm]");
+    if (gmCell) {
+      const i = +gmCell.dataset.editGm;
+      const h = state.metals[i];
+      if (!h) return;
+      const curGm = ozToGm(h.qty).toFixed(3);
+      const next = window.prompt(`Weight in grams for ${h.symbol}:`, curGm);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v) || v <= 0) return toast("Invalid grams", true);
+      h.qty = gmToOz(v);
+      save(); render();
+      return;
+    }
+
+    // 3. Amount (cash, debt)
+    const amtCell = e.target.closest("[data-edit-amt]");
+    if (amtCell) {
+      const [kind, i] = amtCell.dataset.editAmt.split(":");
+      const list = kind === "cash" ? state.cash : state.debt;
+      const c = list[+i];
+      if (!c) return;
+      const next = window.prompt(`New amount for "${c.label}" (${c.currency || "INR"}):`, c.amount);
+      if (next === null) return;
+      const v = parseFloat(next);
+      if (isNaN(v)) return toast("Invalid amount", true);
+      c.amount = v;
+      save(); render();
+      return;
+    }
+  });
+
+  $("addMetalBtn").addEventListener("click", () => {
+    const sym = $("metalSym").value;
+    const raw = parseFloat($("metalQty").value);
+    const unit = $("metalUnit").value;
+    if (!raw || raw <= 0) return toast("Enter a positive quantity", true);
+    const qty = unit === "gm" ? gmToOz(raw) : raw;     // store internally as troy oz
+    state.metals.push({ symbol: sym, qty });
+    save();
+    $("metalQty").value = "";
+    refreshAllPrices();
+  });
+
+  // ------------ Fund search ------------
+  let selectedFund = null;
+  let fundSearchTimer;
+  const fundSearchEl = $("fundSearch");
+  const fundResultsEl = $("fundResults");
+
+  fundSearchEl.addEventListener("input", () => {
+    selectedFund = null;
+    clearTimeout(fundSearchTimer);
+    const q = fundSearchEl.value.trim();
+    if (q.length < 3) { fundResultsEl.classList.remove("show"); return; }
+    fundSearchTimer = setTimeout(async () => {
+      try {
+        const list = await fetchFundSearch(q);
+        if (!list || !list.length) {
+          fundResultsEl.innerHTML = `<div class="fr-item meta">No funds matched "${escapeHtml(q)}"</div>`;
+          fundResultsEl.classList.add("show");
+          return;
+        }
+        fundResultsEl.innerHTML = list.slice(0, 20).map((f) =>
+          `<div class="fr-item" data-code="${f.schemeCode}" data-name="${escapeHtml(f.schemeName)}">
+             ${escapeHtml(f.schemeName)}
+             <span class="meta">AMFI #${f.schemeCode}</span>
+           </div>`
+        ).join("");
+        fundResultsEl.classList.add("show");
+      } catch (e) {
+        fundResultsEl.innerHTML = `<div class="fr-item meta" style="color:var(--red)">Search failed: ${escapeHtml(e.message)}</div>`;
+        fundResultsEl.classList.add("show");
+      }
+    }, 350);
+  });
+
+  fundResultsEl.addEventListener("click", (e) => {
+    const it = e.target.closest(".fr-item");
+    if (!it || !it.dataset.code) return;
+    selectedFund = { schemeCode: it.dataset.code, schemeName: it.dataset.name };
+    fundSearchEl.value = it.dataset.name;
+    fundResultsEl.classList.remove("show");
+    $("fundUnits").focus();
+  });
+
+  document.addEventListener("click", (e) => {
+    if (!fundResultsEl.contains(e.target) && e.target !== fundSearchEl) {
+      fundResultsEl.classList.remove("show");
+    }
+  });
+
+  $("addFundBtn").addEventListener("click", () => {
+    if (!selectedFund) return toast("Search and pick a fund from the list first", true);
+    const units = parseFloat($("fundUnits").value);
+    if (!units || units <= 0) return toast("Enter units", true);
+    state.funds.push({
+      symbol: "MF:" + selectedFund.schemeCode,
+      qty: units,
+      name: selectedFund.schemeName
+    });
+    save();
+    fundSearchEl.value = ""; $("fundUnits").value = ""; selectedFund = null;
+    refreshAllPrices();
+  });
+
+  ["fundUnits"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addFundBtn").click(); }));
+
+  $("addCashBtn").addEventListener("click", () => {
+    const label = ($("cashLabel").value || "").trim();
+    const amt = parseFloat($("cashAmt").value);
+    const currency = $("cashCcy").value || "INR";
+    if (!label) return toast("Enter a label", true);
+    if (isNaN(amt)) return toast("Enter an amount", true);
+    state.cash.push({ label, amount: amt, currency });
+    save();
+    $("cashLabel").value = ""; $("cashAmt").value = "";
+    render();
+  });
+
+  $("addDebtBtn").addEventListener("click", () => {
+    const label = ($("debtLabel").value || "").trim();
+    const amt = parseFloat($("debtAmt").value);
+    const currency = $("debtCcy").value || "INR";
+    if (!label) return toast("Enter a label", true);
+    if (isNaN(amt)) return toast("Enter an amount", true);
+    state.debt.push({ label, amount: amt, currency });
+    save();
+    $("debtLabel").value = ""; $("debtAmt").value = "";
+    render();
+  });
+
+  // ------------ Drag to reorder rows (all sections) ------------
+  // Pointer Events so one code path covers mouse, trackpad, touch and pen.
+  // The dragged <tr> is moved among its siblings live, so what you see during
+  // the drag is exactly where it lands; state is rewritten once, on drop.
+  let drag = null;
+
+  function moveInList(kind, from, to) {
+    const list = listFor(kind);
+    if (!list || from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return false;
+    const [item] = list.splice(from, 1);
+    list.splice(to, 0, item);
+    return true;
+  }
+
+  document.body.addEventListener("pointerdown", (e) => {
+    const handle = e.target.closest("[data-drag]");
+    if (!handle || handle.disabled || e.button > 0) return;
+    const row = handle.closest("tr");
+    const tbody = row && row.parentNode;
+    if (!tbody || tbody.children.length < 2) return;
+
+    e.preventDefault();
+    handle.focus();
+    const [kind] = handle.dataset.drag.split(":");
+    drag = { kind, row, tbody, from: Array.prototype.indexOf.call(tbody.children, row) };
+    try { handle.setPointerCapture(e.pointerId); } catch (err) { /* not fatal */ }
+    row.classList.add("dragging");
+    document.body.classList.add("dragging-active");
+    suppressRender = true;
+  });
+
+  document.body.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const { row, tbody } = drag;
+    const y = e.clientY;
+    let target = null;
+    for (const sib of tbody.children) {
+      if (sib === row) continue;
+      const r = sib.getBoundingClientRect();
+      if (y < r.top + r.height / 2) { target = sib; break; }
+    }
+    if (target) {
+      if (target !== row.nextSibling) tbody.insertBefore(row, target);
+    } else if (row !== tbody.lastElementChild) {
+      tbody.appendChild(row);
+    }
+  });
+
+  function endDrag() {
+    if (!drag) return;
+    const { kind, row, tbody, from } = drag;
+    const to = Array.prototype.indexOf.call(tbody.children, row);
+    row.classList.remove("dragging");
+    document.body.classList.remove("dragging-active");
+    drag = null;
+    suppressRender = false;
+    if (to !== -1 && to !== from && moveInList(kind, from, to)) save();
+    render();
+  }
+  document.body.addEventListener("pointerup", endDrag);
+  document.body.addEventListener("pointercancel", endDrag);
+
+  // Keyboard equivalent — tab to a handle, then ↑ / ↓ to move the row.
+  document.body.addEventListener("keydown", (e) => {
+    const handle = e.target.closest && e.target.closest("[data-drag]");
+    if (!handle || handle.disabled) return;
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    const [kind, idxRaw] = handle.dataset.drag.split(":");
+    const from = +idxRaw;
+    const to = from + (e.key === "ArrowUp" ? -1 : 1);
+    if (!moveInList(kind, from, to)) return;
+    save();
+    render();
+    // Keep focus on the same row after the table is rebuilt.
+    const next = document.querySelector(`[data-drag="${kind}:${to}"]`);
+    if (next) next.focus();
+  });
+
+  // ------------ Inline cell editing ------------
+  // Shared by label editing (cash & debt) and target entry (every section).
+  // `onCommit` receives the trimmed string and returns true if it changed
+  // state, so we only save when something actually moved.
+  function startInlineEdit(cell, { initial, numeric, onCommit }) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "label-edit";
+    input.value = initial;
+    input.maxLength = 80;
+    input.spellcheck = false;
+    if (numeric) {
+      input.inputMode = "decimal";
+      input.style.textAlign = "right";
+    }
+    cell.textContent = "";
+    cell.appendChild(input);
+    suppressRender = true;
+    input.focus();
+    input.select();
+
+    let settled = false;
+    const finish = (commit) => {
+      if (settled) return;
+      settled = true;
+      suppressRender = false;
+      if (commit && onCommit(input.value.trim())) save();
+      render();
+    };
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+      else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+      ev.stopPropagation();
+    });
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("click", (ev) => ev.stopPropagation());
+  }
+
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-label]");
+    if (!cell || cell.querySelector("input")) return;
+    const [kind, idx] = cell.dataset.editLabel.split(":");
+    const list = listFor(kind);
+    const entry = list && list[+idx];
+    if (!entry) return;
+    startInlineEdit(cell, {
+      initial: entry.label,
+      numeric: false,
+      onCommit: (next) => {
+        if (!next || next === entry.label) return false;
+        entry.label = next;
+        return true;
+      }
+    });
+  });
+
+  // Target price / NAV / amount. Blank clears the target for that row.
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-target]");
+    if (!cell || cell.querySelector("input")) return;
+    const [kind, idx] = cell.dataset.editTarget.split(":");
+    const list = listFor(kind);
+    const entry = list && list[+idx];
+    if (!entry) return;
+    startInlineEdit(cell, {
+      initial: hasTarget(entry) ? String(entry.target) : "",
+      numeric: true,
+      onCommit: (next) => {
+        if (next === "") {
+          if (!hasTarget(entry)) return false;
+          delete entry.target;
+          return true;
+        }
+        const v = parseFloat(next);
+        if (isNaN(v)) { toast("Target must be a number", true); return false; }
+        // Prices can't be negative; cash and debt amounts can (a loan).
+        if (v < 0 && kind !== "cash" && kind !== "debt") {
+          toast("Target price can't be negative", true);
+          return false;
+        }
+        if (entry.target === v) return false;
+        entry.target = v;
+        return true;
+      }
+    });
+  });
+
+  // Exempt a holding's gain from the LTCG provision — for a stock where the
+  // gain isn't taxable for you. The holding's value still counts toward net
+  // worth; only its gain leaves the taxable base.
+  document.body.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-tax]");
+    if (!btn) return;
+    const h = state.stocks[+btn.dataset.tax];
+    if (!h) return;
+    if (h.noTax) delete h.noTax; else h.noTax = true;
+    save();
+    render();
+    toast(h.noTax
+      ? `${h.symbol} exempt from the LTCG estimate`
+      : `${h.symbol} back in the LTCG estimate`);
+  });
+
+  // Free-text horizon for the potential figure — "FY28", "Mar 2030", whatever
+  // is meaningful to you. Purely a note to self; nothing computes from it.
+  document.body.addEventListener("click", (e) => {
+    const cell = e.target.closest("[data-edit-horizon]");
+    if (!cell || cell.querySelector("input")) return;
+    startInlineEdit(cell, {
+      initial: state.horizon || "",
+      numeric: false,
+      onCommit: (next) => {
+        if (next === (state.horizon || "")) return false;
+        state.horizon = next;
+        return true;
+      }
+    });
+  });
+
+  $("clearTargetsBtn").addEventListener("click", () => {
+    let changed = false;
+    ["stocks", "funds", "metals", "cash", "debt"].forEach((k) => {
+      (state[k] || []).forEach((entry) => {
+        if (hasTarget(entry)) { delete entry.target; changed = true; }
+      });
+    });
+    if (changed) { save(); toast("Targets cleared"); }
+    render();
+  });
+
+  document.body.addEventListener("click", (e) => {
+    const del = e.target.closest("[data-del]");
+    if (!del) return;
+    const [kind, idx] = del.dataset.del.split(":");
+    const i = +idx;
+    if (kind === "stock") state.stocks.splice(i, 1);
+    if (kind === "fund") state.funds.splice(i, 1);
+    if (kind === "metal") state.metals.splice(i, 1);
+    if (kind === "debt") state.debt.splice(i, 1);
+    if (kind === "cash") state.cash.splice(i, 1);
+    save();
+    render();
+  });
+
+  // Enter key to submit
+  ["stockSym", "stockQty", "stockBuy"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addStockBtn").click(); }));
+  ["metalQty"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addMetalBtn").click(); }));
+  ["cashLabel", "cashAmt"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addCashBtn").click(); }));
+  ["debtLabel", "debtAmt"].forEach((id) => $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") $("addDebtBtn").click(); }));
+
+  // Export / import
+  $("exportBtn").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "net-worth-holdings.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  $("importBtn").addEventListener("click", () => $("importFile").click());
+  $("importFile").addEventListener("change", async (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const txt = await f.text();
+      const data = JSON.parse(txt);
+      if (!data.stocks || !data.metals || !data.cash) throw new Error("bad format");
+      if (!data.funds) data.funds = [];
+      if (!data.debt) data.debt = [];
+      state = data;
+      save();
+      toast("Holdings imported");
+      refreshAllPrices();
+    } catch (err) {
+      toast("Import failed: " + err.message, true);
+    }
+    e.target.value = "";
+  });
+
+  // ============================================================
+  //  CROSS-DEVICE SYNC via private GitHub gist
+  // ============================================================
+  const SYNC_KEY = "netWorthSyncV1";
+  let sync = null;          // { gistId, token } or null
+  let syncSaveTimer = null;
+  let syncPollTimer = null;
+  let syncInFlight = false;
+  try { sync = JSON.parse(localStorage.getItem(SYNC_KEY)) || null; } catch (e) { sync = null; }
+
+  function setSyncStatus(msg, kind) {
+    const el = $("syncStatus");
+    el.textContent = msg;
+    el.className = "pill" + (kind ? " " + kind : "");
+    el.style.display = sync ? "inline-block" : "none";
+  }
+
+  async function gistGet() {
+    const r = await fetch(`https://api.github.com/gists/${encodeURIComponent(sync.gistId)}`, {
+      headers: {
+        "Authorization": `token ${sync.token}`,
+        "Accept": "application/vnd.github+json"
+      },
+      cache: "no-store"
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error(`HTTP ${r.status} ${body.slice(0, 80)}`);
+    }
+    return r.json();
+  }
+
+  async function gistPatch(content) {
+    const r = await fetch(`https://api.github.com/gists/${encodeURIComponent(sync.gistId)}`, {
+      method: "PATCH",
+      headers: {
+        "Authorization": `token ${sync.token}`,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ files: { "holdings.json": { content } } })
+    });
+    if (!r.ok) {
+      const body = await r.text();
+      throw new Error(`HTTP ${r.status} ${body.slice(0, 80)}`);
+    }
+    return r.json();
+  }
+
+  async function pullFromGist({ initial } = {}) {
+    if (!sync || syncInFlight) return;
+    syncInFlight = true;
+    setSyncStatus("Checking…", "syncing");
+    try {
+      const gist = await gistGet();
+      const file = gist.files && gist.files["holdings.json"];
+      if (!file || !file.content || file.content.trim() === "" || file.content.trim() === "{}") {
+        // First-time: gist exists but empty; push our local state up to seed it.
+        await pushToGist({ force: true });
+        return;
+      }
+      let remote;
+      try { remote = JSON.parse(file.content); }
+      catch (e) { setSyncStatus("Bad JSON in gist", "err"); return; }
+      const remoteAt = Number(remote.updatedAt) || 0;
+      const localAt = Number(state.updatedAt) || 0;
+      if (remoteAt > localAt) {
+        applyingRemote = true;
+        state.stocks = remote.stocks || [];
+        state.funds = remote.funds || [];
+        state.metals = remote.metals || [];
+        state.debt = remote.debt || [];
+        state.cash = remote.cash || [];
+        state.fundsPurchase = remote.fundsPurchase || 0;
+        state.taxRate = remote.taxRate != null ? remote.taxRate : 15;
+        state.horizon = remote.horizon || "";
+        state.updatedAt = remoteAt;
+        saveLocal();
+        applyingRemote = false;
+        render();
+        refreshAllPrices();   // pick up prices for any new symbols
+        setSyncStatus("Synced ✓", "synced");
+      } else if (initial && localAt > remoteAt) {
+        // We had unsynced local edits; push them up.
+        await pushToGist({ force: true });
+      } else {
+        setSyncStatus("Synced ✓", "synced");
+      }
+    } catch (e) {
+      console.warn("pull error:", e);
+      setSyncStatus("Sync error: " + e.message, "err");
+    } finally {
+      syncInFlight = false;
+    }
+  }
+
+  async function pushToGist({ force } = {}) {
+    if (!sync) return;
+    if (syncInFlight && !force) return;
+    syncInFlight = true;
+    setSyncStatus("Saving…", "syncing");
+    try {
+      // Bump updatedAt so other devices know we're newer
+      state.updatedAt = Date.now();
+      saveLocal();
+      const payload = {
+        stocks: state.stocks, funds: state.funds, metals: state.metals,
+        debt: state.debt, cash: state.cash,
+        fundsPurchase: state.fundsPurchase, taxRate: state.taxRate,
+        horizon: state.horizon || "",
+        updatedAt: state.updatedAt
+      };
+      await gistPatch(JSON.stringify(payload, null, 2));
+      setSyncStatus("Synced ✓", "synced");
+    } catch (e) {
+      console.warn("push error:", e);
+      setSyncStatus("Save failed: " + e.message, "err");
+    } finally {
+      syncInFlight = false;
+    }
+  }
+
+  function pushGistDebounced() {
+    if (!sync) return;
+    clearTimeout(syncSaveTimer);
+    setSyncStatus("Pending…", "syncing");
+    syncSaveTimer = setTimeout(() => pushToGist(), 800);
+  }
+
+  function startSyncPoll() {
+    if (syncPollTimer) clearInterval(syncPollTimer);
+    if (!sync) return;
+    syncPollTimer = setInterval(() => pullFromGist(), 30_000);
+  }
+
+  function applySyncConfig(newSync) {
+    sync = newSync;
+    if (sync) {
+      localStorage.setItem(SYNC_KEY, JSON.stringify(sync));
+      setSyncStatus("Connecting…", "syncing");
+      pullFromGist({ initial: true });
+      startSyncPoll();
+    } else {
+      localStorage.removeItem(SYNC_KEY);
+      if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
+      $("syncStatus").style.display = "none";
+    }
+  }
+
+  // ---- Sync modal wiring ----
+  const syncModal = $("syncModal");
+  function openSyncModal() {
+    $("gistIdInput").value = sync ? sync.gistId : "";
+    $("gistTokenInput").value = sync ? sync.token : "";
+    $("syncDisconnectBtn").style.display = sync ? "" : "none";
+    syncModal.classList.add("show");
+  }
+  function closeSyncModal() { syncModal.classList.remove("show"); }
+  $("syncBtn").addEventListener("click", openSyncModal);
+  $("syncCloseBtn").addEventListener("click", closeSyncModal);
+  syncModal.addEventListener("click", (e) => { if (e.target === syncModal) closeSyncModal(); });
+  $("syncConnectBtn").addEventListener("click", () => {
+    const gistId = $("gistIdInput").value.trim();
+    const token = $("gistTokenInput").value.trim();
+    if (!gistId || !token) return toast("Both fields are required", true);
+    applySyncConfig({ gistId, token });
+    closeSyncModal();
+    toast("Connected. Syncing…");
+  });
+  $("syncDisconnectBtn").addEventListener("click", () => {
+    if (!confirm("Disconnect sync? Your local data stays put.")) return;
+    applySyncConfig(null);
+    closeSyncModal();
+    toast("Sync disconnected");
+  });
+
+  // Boot sync if previously configured
+  if (sync) {
+    setSyncStatus("Connecting…", "syncing");
+    pullFromGist({ initial: true });
+    startSyncPoll();
+  }
+
+  // Re-pull when tab becomes visible (immediate "are we behind?" check)
+  let lastSyncFocus = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && sync && Date.now() - lastSyncFocus > 5000) {
+      lastSyncFocus = Date.now();
+      pullFromGist();
+    }
+  });
+
+  // Initial render + start refresh loop. 2 minutes is friendly on Yahoo/proxies
+  // while still feeling live; cached prices fill the gap.
+  render();
+  refreshAllPrices();
+  setInterval(refreshAllPrices, 120_000);
+
+  // Re-fetch when tab becomes visible again, but at most once every 30s.
+  let lastFocusFetch = 0;
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    const now = Date.now();
+    if (now - lastFocusFetch < 30_000) return;
+    lastFocusFetch = now;
+    refreshAllPrices();
+  });
+})();
+</script>
+</body>
+</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Live Net Worth Calculator</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg-2: #11172e;
+    --panel: #161e3c;
+    --panel-2: #1b2547;
+    --border: #25315c;
+    --text: #e8ecf8;
+    --muted: #8a93b2;
+    --accent: #6ea8fe;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --gold: #f5b301;
+    --silver: #c0c0c0;
+    --shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    background: radial-gradient(1200px 800px at 20% -10%, #1a2350 0%, transparent 60%),
+                radial-gradient(1000px 700px at 110% 10%, #2a1850 0%, transparent 60%),
+                var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px;
+  }
+  .container { max-width: 1100px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 {
+    font-size: 18px; margin: 0; letter-spacing: .5px;
+    color: var(--muted); font-weight: 500; text-transform: uppercase;
+  }
+  .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+    padding: 6px 12px; border-radius: 999px; font-size: 12px;
+  }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+    transition: all .15s ease;
+  }
+  button:hover { background: var(--panel-2); border-color: var(--accent); }
+  button.primary {
+    background: linear-gradient(135deg, #4f7dff, #6ea8fe); border: none; color: #fff;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.danger { color: var(--red); }
+  button.icon {
+    padding: 6px 10px; font-size: 14px; line-height: 1;
+  }
+
+  /* Row actions: drag handle + remove */
+  .row-actions { display: inline-flex; align-items: center; gap: 4px; justify-content: flex-end; }
+  .drag-handle {
+    background: transparent; border: 1px solid transparent; color: var(--muted);
+    padding: 6px 8px; border-radius: 6px; font-size: 15px; line-height: 1;
+    cursor: grab; touch-action: none; user-select: none;
+  }
+  .drag-handle:hover { color: var(--accent); border-color: var(--border); background: var(--panel); }
+  .drag-handle:focus-visible { outline: none; color: var(--accent); border-color: var(--accent); }
+  .drag-handle:disabled { opacity: .2; cursor: default; }
+  .drag-handle:disabled:hover { color: var(--muted); border-color: transparent; background: transparent; }
+
+  tr.dragging {
+    opacity: .5;
+    background: rgba(110,168,254,.10) !important;
+    outline: 1px dashed var(--accent);
+  }
+  tr.drop-hint td { box-shadow: inset 0 2px 0 0 var(--accent); }
+  body.dragging-active { user-select: none; cursor: grabbing; }
+  body.dragging-active .drag-handle { cursor: grabbing; }
+
+  /* LTCG exemption */
+  button.icon.tax-toggle {
+    padding: 4px 7px; font-size: 11px; font-weight: 700; color: var(--muted);
+  }
+  button.icon.tax-toggle:hover { color: var(--accent); border-color: var(--accent); }
+  button.icon.tax-toggle.exempt {
+    color: var(--green); border-color: rgba(52, 211, 153, .5);
+    background: rgba(52, 211, 153, .10); text-decoration: line-through;
+  }
+  .exempt-tag {
+    display: inline-block; margin-left: 8px; padding: 1px 6px;
+    border-radius: 5px; font-size: 10px; font-weight: 600; letter-spacing: .3px;
+    text-transform: uppercase; vertical-align: middle;
+    color: var(--green); background: rgba(52, 211, 153, .12);
+    border: 1px solid rgba(52, 211, 153, .35);
+  }
+
+  /* Inline label editing (cash & debt) */
+  .label-edit {
+    background: var(--bg-2); border: 1px solid var(--accent); color: var(--text);
+    padding: 5px 8px; border-radius: 6px; font-size: 14px; font-weight: 600;
+    width: 100%; max-width: 280px; letter-spacing: .3px;
+  }
+  .label-edit:focus { outline: none; }
+
+  .hero {
+    background: linear-gradient(135deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--border);
+    border-radius: 18px; padding: 28px;
+    box-shadow: var(--shadow);
+    margin-bottom: 24px;
+    position: relative; overflow: hidden;
+  }
+  .hero::after {
+    content: ""; position: absolute; right: -80px; top: -80px;
+    width: 280px; height: 280px;
+    background: radial-gradient(closest-side, rgba(110,168,254,.25), transparent);
+  }
+  /* Hero splits into current (left) and potential (right) when targets are set */
+  .hero-split { display: flex; gap: 28px; align-items: flex-start; position: relative; z-index: 1; }
+  .hero-current { flex: 1 1 auto; min-width: 0; }
+  .hero-projection {
+    flex: 0 0 auto; min-width: 220px; max-width: 340px;
+    border-left: 1px solid var(--border); padding-left: 24px;
+  }
+  .proj-value {
+    font-size: 34px; font-weight: 700; margin: 10px 0 2px;
+    letter-spacing: -.5px; font-variant-numeric: tabular-nums; color: var(--text);
+  }
+  .proj-usd { font-size: 16px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .proj-delta {
+    display: inline-block; margin-top: 10px; padding: 3px 9px;
+    border-radius: 6px; font-size: 13px; font-weight: 600;
+  }
+  /* Free-text horizon: "by FY28" */
+  .proj-by { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .proj-by-label { margin-right: 4px; }
+  .proj-by-value {
+    color: var(--text); font-weight: 600;
+    border-bottom: 1px dashed var(--border); padding-bottom: 1px;
+  }
+  .proj-by-value:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  .proj-by-value.unset { color: var(--muted); font-weight: 400; font-style: italic; }
+  .proj-by .label-edit { max-width: 160px; font-size: 13px; }
+
+  /* Annualised rate implied by the horizon */
+  .proj-irr { margin-top: 8px; }
+  .irr-rate { display: block; font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .irr-basis { display: block; color: var(--muted); font-size: 11.5px; margin-top: 3px; line-height: 1.5; }
+
+  .proj-note { display: block; color: var(--muted); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
+  .proj-clear {
+    margin-top: 12px; padding: 5px 10px; font-size: 12px;
+    background: transparent; border: 1px solid var(--border); color: var(--muted);
+  }
+  .proj-clear:hover { color: var(--red); border-color: var(--red); background: transparent; }
+
+  /* Target cells */
+  .target-cell { cursor: pointer; }
+  .target-cell:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .target-unset { color: var(--muted); font-style: italic; opacity: .7; }
+  .target-set { color: var(--accent); font-weight: 600; }
+  .target-delta { display: block; font-size: 11px; margin-top: 2px; font-weight: 500; }
+  /* "At target" line under a row's current value */
+  .proj-line {
+    margin-top: 7px; padding-top: 6px;
+    border-top: 1px dashed rgba(110,168,254,.28);
+    color: var(--accent); font-size: 13px;
+  }
+  .proj-line .proj-arrow { opacity: .65; margin-right: 2px; }
+  .proj-line .proj-inr { color: var(--accent); opacity: .75; font-size: 12px; }
+  .proj-line .pct-line { color: var(--accent); opacity: .7; }
+  .section-proj { color: var(--accent); font-size: 13px; font-weight: 600; margin-left: 8px; }
+
+  .hero-label { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 1.5px; }
+  .hero-value {
+    font-size: 56px; font-weight: 700; margin: 10px 0 2px;
+    letter-spacing: -1px;
+    font-variant-numeric: tabular-nums;
+  }
+  .hero-value-2 {
+    font-size: 22px; font-weight: 500; color: var(--muted); margin-bottom: 8px;
+    font-variant-numeric: tabular-nums; letter-spacing: -.3px;
+  }
+  .hero-sub { color: var(--muted); font-size: 13px; }
+  .fx-pill {
+    display: inline-block; margin-left: 8px; padding: 2px 8px;
+    border-radius: 6px; font-size: 12px; color: var(--muted);
+    background: rgba(255,255,255,.04); border: 1px solid var(--border);
+  }
+  .hero-day {
+    display: inline-block; margin-left: 8px; padding: 2px 8px;
+    border-radius: 6px; font-size: 13px; font-weight: 600;
+  }
+  .up { color: var(--green); background: rgba(52, 211, 153, .12); }
+  .down { color: var(--red); background: rgba(248, 113, 113, .12); }
+  .flat { color: var(--muted); background: rgba(138,147,178,.12); }
+
+  .breakdown {
+    display: flex; gap: 6px; height: 8px; border-radius: 999px;
+    overflow: hidden; margin-top: 18px; background: rgba(255,255,255,.04);
+  }
+  .breakdown div { transition: width .4s ease; }
+  .legend {
+    display: flex; gap: 18px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--muted);
+  }
+  .legend span::before {
+    content: ""; display: inline-block; width: 10px; height: 10px;
+    border-radius: 3px; margin-right: 6px; vertical-align: middle;
+  }
+  .legend .l-stocks::before { background: #6ea8fe; }
+  .legend .l-funds::before { background: #34d399; }
+  .legend .l-debt::before { background: #f59e0b; }
+  .legend .l-metals::before { background: var(--gold); }
+  .legend .l-cash::before { background: #a78bfa; }
+
+  /* Per-section % badge in heading */
+  .section-pct {
+    display: inline-block;
+    padding: 2px 8px; margin-left: 8px;
+    background: rgba(255,255,255,.05);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 11px; font-weight: 500;
+    border-radius: 6px; letter-spacing: 0;
+    font-variant-numeric: tabular-nums;
+    text-transform: none;
+  }
+
+  /* Per-row pct line and editable cells */
+  .pct-line {
+    display: block; color: var(--muted); font-size: 11px; margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  .buy-cell, .editable { cursor: pointer; }
+  .buy-cell:hover, .editable:hover { color: var(--accent); text-decoration: underline; text-decoration-style: dotted; }
+  .buy-set { color: var(--muted); font-style: italic; }
+
+  /* Tax + section meta */
+  .tax-caption {
+    color: var(--muted); font-size: 12px; margin-top: 8px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .tax-caption input.rate {
+    background: rgba(255,255,255,.04); border: 1px solid var(--border); color: var(--text);
+    padding: 2px 6px; border-radius: 4px; width: 54px; font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tax-caption input.rate:focus { outline: none; border-color: var(--accent); }
+
+  .section-meta {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: -8px 0 12px; font-size: 12px; color: var(--muted);
+  }
+  .section-meta input {
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; width: 160px;
+    font-variant-numeric: tabular-nums;
+  }
+  .section-meta input:focus { outline: none; border-color: var(--accent); }
+  .gain-up { color: var(--green); }
+  .gain-down { color: var(--red); }
+
+  /* Fund search dropdown */
+  .fund-search-wrap { flex: 1 1 280px; position: relative; }
+  .fund-search-wrap input { width: 100%; }
+  .fund-results {
+    display: none; position: absolute; left: 0; right: 0; top: calc(100% + 4px);
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+    max-height: 280px; overflow-y: auto; z-index: 10; box-shadow: var(--shadow);
+  }
+  .fund-results.show { display: block; }
+  .fr-item { padding: 9px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,.04); }
+  .fr-item:last-child { border-bottom: none; }
+  .fr-item:hover { background: var(--panel-2); }
+  .fr-item .meta { display: block; font-size: 11px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px 20px; margin-bottom: 18px;
+    box-shadow: var(--shadow);
+  }
+  .panel h2 {
+    margin: 0 0 14px; font-size: 14px; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--muted); font-weight: 600;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel h2 .total { color: var(--text); font-size: 16px; }
+
+  /* Tables carry a lot of columns; let them scroll inside their panel on
+     narrow screens rather than pushing the whole page sideways. */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-scroll table { min-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  thead th {
+    text-align: left; padding: 10px 8px; font-weight: 500;
+    color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
+    border-bottom: 1px solid var(--border);
+  }
+  thead th.num { text-align: right; }
+  tbody td {
+    padding: 12px 8px; border-bottom: 1px solid rgba(255,255,255,.04);
+    font-variant-numeric: tabular-nums;
+  }
+  tbody td.num { text-align: right; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,.02); }
+  .sym { font-weight: 600; letter-spacing: .3px; }
+  .meta { color: var(--muted); font-size: 12px; }
+
+  .add-row { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .add-row input, .add-row select {
+    background: var(--bg-2); border: 1px solid var(--border); color: var(--text);
+    padding: 9px 12px; border-radius: 8px; font-size: 13px; min-width: 0;
+  }
+  .add-row input:focus, .add-row select:focus { outline: none; border-color: var(--accent); }
+  .add-row .sym-input { flex: 1 1 140px; text-transform: uppercase; }
+  .add-row .qty-input { flex: 1 1 120px; }
+  .add-row button { flex: 0 0 auto; }
+
+  .empty {
+    text-align: center; padding: 24px 12px; color: var(--muted); font-size: 13px;
+    border: 1px dashed var(--border); border-radius: 10px;
+  }
+
+  /* Sync modal */
+  .modal {
+    position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,.65); backdrop-filter: blur(4px);
+    display: none; align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal.show { display: flex; }
+  .modal-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px; max-width: 520px; width: 100%;
+    box-shadow: var(--shadow); max-height: 90vh; overflow-y: auto;
+  }
+  .modal-card h3 { margin: 0 0 6px; font-size: 18px; }
+  .modal-card .modal-desc { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+  .modal-card label {
+    display: block; font-size: 11px; color: var(--muted);
+    margin: 14px 0 4px; text-transform: uppercase; letter-spacing: .8px;
+  }
+  .modal-card input {
+    width: 100%; background: var(--bg-2); border: 1px solid var(--border);
+    color: var(--text); padding: 10px 12px; border-radius: 8px;
+    font-size: 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .modal-card input:focus { outline: none; border-color: var(--accent); }
+  .modal-card .hint { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .modal-card .hint a { color: var(--accent); }
+  .modal-actions {
+    display: flex; gap: 8px; margin-top: 20px; flex-wrap: wrap;
+  }
+
+  /* Status pill colors */
+  .pill.synced { color: var(--green); border-color: rgba(52,211,153,.3); }
+  .pill.syncing { color: var(--accent); }
+  .pill.err { color: var(--red); border-color: rgba(248,113,113,.3); }
+
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; padding: 12px 16px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    color: var(--text); font-size: 13px; box-shadow: var(--shadow);
+    transform: translateY(120%); transition: transform .25s ease;
+    max-width: 320px;
+  }
+  .toast.show { transform: translateY(0); }
+  .toast.error { border-color: var(--red); }
+
+  .footer-note { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  .spinner {
+    display: inline-block; width: 12px; height: 12px;
+    border: 2px solid rgba(255,255,255,.2); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 600px) {
+    body { padding: 14px; }
+    .hero-value { font-size: 40px; }
+    thead th.hide-sm, tbody td.hide-sm { display: none; }
+    /* Potential stacks under current rather than beside it */
+    .hero-split { flex-direction: column; gap: 18px; }
+    .hero-projection {
+      border-left: none; border-top: 1px solid var(--border);
+      padding-left: 0; padding-top: 16px; max-width: none; width: 100%;
+    }
+    .proj-value { font-size: 28px; }
+    /* Tighten rows so the action cluster fits inside the panel */
+    tbody td, thead th { padding: 10px 4px; }
+    .row-actions { gap: 2px; }
+    button.icon { padding: 5px 7px; font-size: 12px; }
+    .drag-handle { padding: 6px 5px; font-size: 14px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Live Net Worth</h1>
+    <div class="controls">
+      <span class="pill" id="status">Idle</span>
+      <span class="pill" id="syncStatus" style="display:none">Sync off</span>
+      <button id="syncBtn" title="Cross-device sync via private GitHub gist">⇄ Sync</button>
+      <button id="refreshBtn" class="primary">↻ Refresh</button>
+      <button id="exportBtn" title="Export holdings as JSON">⬇ Export</button>
+      <button id="importBtn" title="Import holdings from JSON">⬆ Import</button>
+      <input type="file" id="importFile" accept="application/json" style="display:none" />
+    </div>
+  </header>
+
+  <!-- Sync settings modal -->
+  <div id="syncModal" class="modal">
+    <div class="modal-card">
+      <h3>Cross-device sync</h3>
+      <p class="modal-desc">
+        Mirror your holdings across devices via a <strong>private GitHub gist</strong>.
+        Data stays in your own GitHub account; nothing goes through any third-party service.
+        Pulls every 30s; pushes within 1s of any edit.
+      </p>
+
+      <label>Gist ID</label>
+      <input id="gistIdInput" placeholder="e.g. a1b2c3d4e5f6789abcdef..." spellcheck="false" />
+      <span class="hint">From your gist URL: <code>gist.github.com/USERNAME/<b>THIS_PART</b></code></span>
+
+      <label>Personal Access Token (gist scope)</label>
+      <input id="gistTokenInput" type="password" placeholder="ghp_..." spellcheck="false" />
+      <span class="hint">Create at <a href="https://github.com/settings/tokens" target="_blank">github.com/settings/tokens</a> → Generate new token (classic) → only check the <code>gist</code> scope.</span>
+
+      <div class="modal-actions">
+        <button id="syncConnectBtn" class="primary">Connect</button>
+        <button id="syncDisconnectBtn" class="danger" style="display:none">Disconnect</button>
+        <button id="syncCloseBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <section class="hero">
+    <div class="hero-split">
+      <div class="hero-current">
+        <div class="hero-label">Total Net Worth</div>
+        <div class="hero-value" id="totalValueInr">₹0.00 Cr</div>
+        <div class="hero-value-2" id="totalValueUsd">$0.00 Mn</div>
+        <div class="hero-sub">
+          <span id="lastUpdated">Never updated</span>
+          <span id="totalDay" class="hero-day flat">—</span>
+          <span id="fxPill" class="fx-pill">USD/INR —</span>
+        </div>
+      </div>
+
+      <!-- Only rendered once at least one target is set. -->
+      <div class="hero-projection" id="heroProjection" style="display:none">
+        <div class="hero-label">Potential</div>
+        <div class="proj-value" id="projValueInr">—</div>
+        <div class="proj-usd" id="projValueUsd">—</div>
+        <div><span class="proj-delta flat" id="projDelta">—</span></div>
+        <div class="proj-by">
+          <span class="proj-by-label">by</span>
+          <span class="proj-by-value editable" id="projHorizon" data-edit-horizon
+                title="Click to set when you aim to reach this">—</span>
+        </div>
+        <div class="proj-irr" id="projIrr"></div>
+        <span class="proj-note" id="projNote"></span>
+        <button class="proj-clear" id="clearTargetsBtn">Clear all targets</button>
+      </div>
+    </div>
+
+    <div class="breakdown" id="breakdown"></div>
+    <div class="legend">
+      <span class="l-stocks">Stocks <span id="legend-stocks">—</span></span>
+      <span class="l-funds">Mutual Funds <span id="legend-funds">—</span></span>
+      <span class="l-metals">Metals <span id="legend-metals">—</span></span>
+      <span class="l-cash">Cash &amp; Other <span id="legend-cash">—</span></span>
+      <span class="l-debt">Debt <span id="legend-debt">—</span></span>
+    </div>
+    <div class="tax-caption">
+      <span id="taxText">Net of est. LTCG: —</span>
+      <span>·</span>
+      <span>Rate <input id="taxRate" class="rate" type="number" step="0.5" min="0" max="50" /> %</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Stocks &amp; ETFs <span class="section-pct" id="stocksPct">—</span></span> <span class="total" id="stocksTotal">—</span></h2>
+    <div id="stocksTable"></div>
+    <div class="add-row">
+      <input id="stockSym" class="sym-input" placeholder="Ticker — US: AAPL · NSE: MANAPPURAM.NS · BSE: 531213.BO" />
+      <input id="stockQty" class="qty-input" type="number" step="any" min="0" placeholder="Shares" />
+      <input id="stockBuy" class="qty-input" type="number" step="any" min="0" placeholder="Avg buy price (optional)" />
+      <button class="primary" id="addStockBtn">Add holding</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Mutual Funds <span class="section-pct" id="fundsPct">—</span></span> <span class="total" id="fundsTotal">—</span></h2>
+    <div class="section-meta">
+      <label for="fundsPurchase">Total invested (₹):</label>
+      <input id="fundsPurchase" type="number" step="any" min="0" placeholder="e.g. 1500000" />
+      <span id="fundsGain">—</span>
+    </div>
+    <div id="fundsTable"></div>
+    <div class="add-row">
+      <div class="fund-search-wrap">
+        <input id="fundSearch" placeholder="Search Indian MF (e.g. Nippon India Gold Savings Growth)" autocomplete="off" />
+        <div id="fundResults" class="fund-results"></div>
+      </div>
+      <input id="fundUnits" class="qty-input" type="number" step="any" min="0" placeholder="Units" />
+      <button class="primary" id="addFundBtn">Add</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Precious Metals <span class="section-pct" id="metalsPct">—</span></span> <span class="total" id="metalsTotal">—</span></h2>
+    <div id="metalsTable"></div>
+    <div class="add-row">
+      <select id="metalSym" class="sym-input">
+        <option value="GC=F">Gold (per troy oz)</option>
+        <option value="SI=F">Silver (per troy oz)</option>
+        <option value="PL=F">Platinum (per troy oz)</option>
+        <option value="PA=F">Palladium (per troy oz)</option>
+      </select>
+      <input id="metalQty" class="qty-input" type="number" step="any" min="0" placeholder="Quantity" />
+      <select id="metalUnit" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="oz">troy oz</option>
+        <option value="gm">grams</option>
+      </select>
+      <button class="primary" id="addMetalBtn">Add holding</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Cash &amp; Other <span class="section-pct" id="cashPct">—</span></span> <span class="total" id="cashTotal">—</span></h2>
+    <div id="cashTable"></div>
+    <div class="add-row">
+      <input id="cashLabel" class="sym-input" placeholder="Label (e.g. HDFC Savings, Chase Checking)" />
+      <input id="cashAmt" class="qty-input" type="number" step="any" placeholder="Amount" />
+      <select id="cashCcy" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="INR">INR</option>
+        <option value="USD">USD</option>
+      </select>
+      <button class="primary" id="addCashBtn">Add</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span>Debt <span class="section-pct" id="debtPct">—</span></span> <span class="total" id="debtTotal">—</span></h2>
+    <div id="debtTable"></div>
+    <div class="add-row">
+      <input id="debtLabel" class="sym-input" placeholder="Label (e.g. HDFC FD 7.1%, PPF, NPS Tier 1, GoI Bond)" />
+      <input id="debtAmt" class="qty-input" type="number" step="any" placeholder="Amount" />
+      <select id="debtCcy" style="background: var(--bg-2); border: 1px solid var(--border); color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 13px;">
+        <option value="INR">INR</option>
+        <option value="USD">USD</option>
+      </select>
+      <button class="primary" id="addDebtBtn">Add</button>
+    </div>
+  </section>
+
+  <p class="footer-note">
+    Prices &amp; USD/INR via Yahoo Finance (private proxy if configured, public proxy fallbacks) · Auto-refresh every 2 min · Cached locally so values persist if a fetch fails.
+  </p>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ------------ Storage ------------
+  const STORAGE_KEY = "netWorthCalcV1";
+  const defaultState = {
+    stocks: [], metals: [], funds: [], debt: [], cash: [],
+    fundsPurchase: 0,   // total INR invested across all mutual funds (single number)
+    horizon: "",        // free text: when you aim to reach the potential, e.g. "FY28"
+    taxRate: 15,        // %, editable LTCG rate applied to net stock + fund gain
+    updatedAt: 0        // ms epoch — bumped on every save() and used for sync conflict resolution
+  };
+  let state;
+  try {
+    state = JSON.parse(localStorage.getItem(STORAGE_KEY)) || defaultState;
+    if (!state.stocks) state = defaultState;
+    if (!state.funds) state.funds = [];
+    if (!state.debt) state.debt = [];                // migration for older saves
+    if (state.fundsPurchase == null) state.fundsPurchase = 0;
+    if (state.horizon == null) state.horizon = "";
+    if (state.taxRate == null) state.taxRate = 15;
+    if (state.updatedAt == null) state.updatedAt = 0;
+  } catch (e) {
+    state = defaultState;
+  }
+
+  // applyingRemote toggles off the gist-push when we're applying a pull from remote
+  let applyingRemote = false;
+  const saveLocal = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const save = () => {
+    if (!applyingRemote) state.updatedAt = Date.now();
+    saveLocal();
+    if (!applyingRemote) pushGistDebounced();
+  };
+
+  // ------------ Price cache (persisted) ------------
+  // ticker -> { price, prevClose, name, currency, ts }
+  const PRICE_CACHE_KEY = "netWorthPriceCacheV1";
+  let prices;
+  try { prices = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY)) || {}; }
+  catch (e) { prices = {}; }
+  const savePrices = () => localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(prices));
+
+  // USD/INR exchange rate (e.g. 83.5 => 1 USD = 83.5 INR). Defaults until first fetch.
+  let usdInr = Number(localStorage.getItem("usdInrRate")) || 83;
+
+  // ------------ Helpers ------------
+  const $ = (id) => document.getElementById(id);
+  const pct = (n) => (n >= 0 ? "+" : "") + n.toFixed(2) + "%";
+
+  // Convert any (amount, ccy) to INR or USD
+  const toINR = (amt, ccy) => ccy === "USD" ? amt * usdInr : amt;
+  const toUSD = (amt, ccy) => ccy === "USD" ? amt : amt / usdInr;
+
+  // Indian numbering: 1 Cr = 1,00,00,000 (10⁷); 1 Lakh = 1,00,000 (10⁵)
+  function fmtCr(inr) {
+    const cr = inr / 1e7;
+    if (Math.abs(cr) >= 1) return "₹" + cr.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " Cr";
+    const lakh = inr / 1e5;
+    if (Math.abs(lakh) >= 1) return "₹" + lakh.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " L";
+    return "₹" + Math.round(inr).toLocaleString("en-IN");
+  }
+  function fmtMn(usd) {
+    const mn = usd / 1e6;
+    if (Math.abs(mn) >= 1) return "$" + mn.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " Mn";
+    const k = usd / 1e3;
+    if (Math.abs(k) >= 1) return "$" + k.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " K";
+    return "$" + Math.round(usd).toLocaleString("en-US");
+  }
+  // Native-currency formatters (per-row prices/values)
+  function fmtNative(amt, ccy) {
+    if (ccy === "INR") return "₹" + (amt || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return "$" + (amt || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  // Combined "₹X Cr / $Y Mn" used in section totals
+  const fmtBoth = (inr) => fmtCr(inr) + " · " + fmtMn(inr / usdInr);
+
+  // Ounce ↔ gram (precious metals) — using user-specified 28.35
+  const OZ_TO_GM = 28.35;
+  const ozToGm = (oz) => oz * OZ_TO_GM;
+  const gmToOz = (gm) => gm / OZ_TO_GM;
+  const fmtGm = (gm) => (gm >= 1000 ? gm.toLocaleString("en-IN", { maximumFractionDigits: 1 }) : gm.toFixed(2)) + " g";
+
+  let toastTimer;
+  function toast(msg, isError) {
+    const t = $("toast");
+    t.textContent = msg;
+    t.classList.toggle("error", !!isError);
+    t.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove("show"), 3200);
+  }
+
+  // ------------ Yahoo Finance fetch ------------
+  // Yahoo sends no CORS headers, so a browser on github.io can never call it directly.
+  //
+  // PRICE_PROXY: URL of your own Cloudflare Worker (see worker.js in this repo).
+  // When set, every Yahoo symbol is fetched in ONE request, usually in well under a second.
+  // Leave it empty to use the free public proxies below, which are slow and often down.
   const PRICE_PROXY = "";
 
   // Batched fetch through the private proxy. Returns { SYM: {price, prevClose, name, currency} }.
