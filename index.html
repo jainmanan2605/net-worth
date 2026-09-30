@@ -871,7 +871,7 @@
     $("lastUpdated").textContent = "Updated " + new Date().toLocaleTimeString();
     render();
     refreshing = false;
-    if (!failed.length && fx && fx.price && !fx.stale) saveDailySnapshot();
+    if (!failed.length && fx && fx.price && !fx.stale) { pricesFreshAt = Date.now(); saveDailySnapshot(); }
   }
 
   // ------------ Render ------------
@@ -2104,6 +2104,7 @@
   const CSV_HEADER = "Date,Net worth (INR),Net worth (Cr),USD/INR,Source,Saved at (IST)";
   let history = null;            // [{ date, inr, source, time, line }] sorted by date; null = not loaded
   let lastSiteSave = 0;
+  let pricesFreshAt = 0;          // last refresh where every price came back fresh
 
   const istNow = () => {
     const s = new Date(Date.now() + 5.5 * 3600e3).toISOString();
@@ -2132,6 +2133,7 @@
     try {
       history = parseHistory(await gistFileText(gist.files && gist.files[HISTORY_FILE]));
       renderHistory();
+      saveDailySnapshot();   // covers the first load, where prices can land before history
     } catch (e) { console.warn("history load failed:", e); }
   }
 
@@ -2140,6 +2142,7 @@
   // Worker's nightly row.
   async function saveDailySnapshot() {
     if (!sync || !history || !lastHeadline || !lastHeadline.complete) return;
+    if (Date.now() - pricesFreshAt > 5 * 60e3) return;   // never save from cached prices
     if (Date.now() - lastSiteSave < 30 * 60e3) return;
     const { date, time } = istNow();
     const today = history.find((r) => r.date === date);
