@@ -1129,14 +1129,14 @@
       if (isStock) {
         if (h.purchasePrice != null && h.purchasePrice > 0) {
           // % return vs. buy price (native currency, so no FX involved),
-          // shown ahead of the absolute ₹ gain.
+          // shown on its own line below the absolute ₹ gain.
           const gainPct = ready && v.price != null
             ? ((v.price - h.purchasePrice) / h.purchasePrice) * 100
             : null;
+          const gainCls = ready && v.gainINR != null && v.gainINR >= 0 ? "gain-up" : "gain-down";
           const gainHtml = ready && v.gainINR != null
-            ? `<div class="pct-line ${v.gainINR >= 0 ? "gain-up" : "gain-down"}">` +
-              (gainPct != null ? `<strong>${pct(gainPct)}</strong> · ` : "") +
-              `${v.gainINR >= 0 ? "+" : ""}${fmtCr(v.gainINR)}</div>`
+            ? `<div class="pct-line ${gainCls}">${v.gainINR >= 0 ? "+" : ""}${fmtCr(v.gainINR)}</div>` +
+              (gainPct != null ? `<div class="pct-line ${gainCls}"><strong>${pct(gainPct)}</strong></div>` : "")
             : "";
           buyCell = `<td class="num hide-sm buy-cell" data-edit-buy="${i}">${fmtNative(h.purchasePrice, ready ? v.currency : "INR")}${gainHtml}</td>`;
         } else {
