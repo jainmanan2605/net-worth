@@ -1199,10 +1199,11 @@
     const priceLabel = kind === "fund" ? "NAV" : "Price";
     const buyHead = isStock ? `<th class="num hide-sm">Buy</th>` : "";
 
-    // Total unrealized gain across stocks: absolute (₹) and % of cost basis.
-    // Counts every stock that has both a buy price and a live price — LTCG
-    // exemption doesn't matter here, this is plain P&L. Holdings missing
-    // either are left out, and the footer says so.
+    // Totals row for stocks: amount invested (cost basis), what it's worth
+    // today, and the gain as ₹ and % of cost. All in ₹, over the same set of
+    // holdings, so invested + gain = today. Counts every stock that has both a
+    // buy price and a live price — LTCG exemption doesn't matter here, this is
+    // plain P&L. Holdings missing either are left out, and the footer says so.
     let footHtml = "";
     if (isStock) {
       let totGain = 0, totCost = 0, counted = 0;
@@ -1221,16 +1222,21 @@
         footHtml = `
         <tfoot>
           <tr>
-            <td><span class="tot-label">Total gain</span>${partial}</td>
+            <td><span class="tot-label">Total</span>${partial}</td>
             <td class="num"></td>
             <td class="num hide-sm"></td>
             <td class="num hide-sm">
+              <div class="meta">Invested</div>
+              <div>${fmtCr(totCost)}</div>
               <div class="pct-line ${cls}">${fmtSignedCr(totGain)}</div>
               <div class="pct-line ${cls}">${fmtSignedPct((totGain / totCost) * 100)}</div>
             </td>
             <td class="num hide-sm"></td>
             <td class="num"></td>
-            <td class="num"></td>
+            <td class="num">
+              <div class="meta">Today</div>
+              <div><strong>${fmtCr(totCost + totGain)}</strong></div>
+            </td>
             <td></td>
           </tr>
         </tfoot>`;
