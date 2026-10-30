@@ -309,6 +309,12 @@
   tbody td.num { text-align: right; }
   tbody tr:last-child td { border-bottom: none; }
   tbody tr:hover { background: rgba(255,255,255,.02); }
+  tfoot td {
+    padding: 12px 8px; border-top: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }
+  tfoot td.num { text-align: right; }
+  tfoot .tot-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
   .sym { font-weight: 600; letter-spacing: .3px; }
   .meta { color: var(--muted); font-size: 12px; }
 
@@ -386,7 +392,7 @@
   @media (max-width: 600px) {
     body { padding: 14px; }
     .hero-value { font-size: 40px; }
-    thead th.hide-sm, tbody td.hide-sm { display: none; }
+    thead th.hide-sm, tbody td.hide-sm, tfoot td.hide-sm { display: none; }
     /* Potential stacks under current rather than beside it */
     .hero-split { flex-direction: column; gap: 18px; }
     .hero-projection {
@@ -678,6 +684,9 @@
     if (Math.abs(lakh) >= 1) return "₹" + lakh.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " L";
     return "₹" + Math.round(inr).toLocaleString("en-IN");
   }
+  // Signed amount with the sign in front of the ₹ (fmtCr alone would give "₹-45,000").
+  const fmtSignedCr = (inr) => (inr >= 0 ? "+" : "−") + fmtCr(Math.abs(inr));
+  const fmtSignedPct = (n) => (n >= 0 ? "+" : "−") + Math.abs(n).toFixed(2) + "%";
   function fmtMn(usd) {
     const mn = usd / 1e6;
     if (Math.abs(mn) >= 1) return "$" + mn.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " Mn";
@@ -1135,8 +1144,8 @@
             : null;
           const gainCls = ready && v.gainINR != null && v.gainINR >= 0 ? "gain-up" : "gain-down";
           const gainHtml = ready && v.gainINR != null
-            ? `<div class="pct-line ${gainCls}">${v.gainINR >= 0 ? "+" : ""}${fmtCr(v.gainINR)}</div>` +
-              (gainPct != null ? `<div class="pct-line ${gainCls}"><strong>${pct(gainPct)}</strong></div>` : "")
+            ? `<div class="pct-line ${gainCls}">${fmtSignedCr(v.gainINR)}</div>` +
+              (gainPct != null ? `<div class="pct-line ${gainCls}">${fmtSignedPct(gainPct)}</div>` : "")
             : "";
           buyCell = `<td class="num hide-sm buy-cell" data-edit-buy="${i}">${fmtNative(h.purchasePrice, ready ? v.currency : "INR")}${gainHtml}</td>`;
         } else {
@@ -1189,6 +1198,44 @@
     const qtyLabel  = kind === "fund" ? "Units" : "Qty";
     const priceLabel = kind === "fund" ? "NAV" : "Price";
     const buyHead = isStock ? `<th class="num hide-sm">Buy</th>` : "";
+
+    // Total unrealized gain across stocks: absolute (₹) and % of cost basis.
+    // Counts every stock that has both a buy price and a live price — LTCG
+    // exemption doesn't matter here, this is plain P&L. Holdings missing
+    // either are left out, and the footer says so.
+    let footHtml = "";
+    if (isStock) {
+      let totGain = 0, totCost = 0, counted = 0;
+      list.forEach((h) => {
+        const hv = holdingValue(h);
+        if (hv && hv.valueNative != null && hv.gainINR != null) {
+          totGain += hv.gainINR;
+          totCost += toINR(h.purchasePrice * h.qty, hv.currency);
+          counted++;
+        }
+      });
+      if (counted > 0 && totCost > 0) {
+        const cls = totGain >= 0 ? "gain-up" : "gain-down";
+        const partial = counted < list.length
+          ? `<div class="meta">${counted} of ${list.length} holdings</div>` : "";
+        footHtml = `
+        <tfoot>
+          <tr>
+            <td><span class="tot-label">Total gain</span>${partial}</td>
+            <td class="num"></td>
+            <td class="num hide-sm"></td>
+            <td class="num hide-sm">
+              <div class="pct-line ${cls}">${fmtSignedCr(totGain)}</div>
+              <div class="pct-line ${cls}">${fmtSignedPct((totGain / totCost) * 100)}</div>
+            </td>
+            <td class="num hide-sm"></td>
+            <td class="num"></td>
+            <td class="num"></td>
+            <td></td>
+          </tr>
+        </tfoot>`;
+      }
+    }
     return `
       <div class="table-scroll">
       <table>
@@ -1204,7 +1251,7 @@
             <th></th>
           </tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody>${rows}</tbody>${footHtml}
       </table>
       </div>`;
   }
